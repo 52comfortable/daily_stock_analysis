@@ -66,6 +66,7 @@ def _print_text_summary(result: Dict[str, Any]) -> None:
     """
     alerts = result.get("alerts") or []
     positions = result.get("positions") or []
+    skipped_codes = {p.code for p in (result.get("skipped") or [])}
     as_of = result.get("as_of") or ""
     lines = [f"\n=== 持仓回撤预警 · {as_of} ==="]
     lines.append(f"扫描 {len(positions)} 只持仓，触发 {len(alerts)} 只\n")
@@ -89,14 +90,22 @@ def _print_text_summary(result: Dict[str, Any]) -> None:
             if p.remaining_upside_pct is not None
             else "-"
         )
+        gain = (
+            f"gain {p.peak_gain_pct:+.2f}%" if p.peak_gain_pct is not None else "gain -"
+        )
         sev = next(
             (a.severity for a in alerts if a.position.code == p.code), None
         )
-        marker = (SEVERITY_GLYPH[sev] + " " + sev.value) if sev else "ok"
+        if sev:
+            marker = SEVERITY_GLYPH[sev] + " " + sev.value
+        elif p.code in skipped_codes:
+            marker = "skipped"
+        else:
+            marker = "ok"
         lines.append(
             f"  [{marker:>10}] {p.name}({p.code}) "
             f"cost={p.cost_price:.2f} {peak_str} {close_str} "
-            f"dd={dd} upside={upside}"
+            f"dd={dd} upside={upside} {gain}"
         )
     if not alerts:
         lines.append("\n(无触发)")
@@ -150,7 +159,8 @@ def run(
         ("warning", "POSITION_DRAWDOWN_WARNING_PCT"),
         ("severe", "POSITION_DRAWDOWN_SEVERE_PCT"),
         ("critical", "POSITION_DRAWDOWN_CRITICAL_PCT"),
-        ("severe_upside", "POSITION_DRAWDOWN_SEVERE_UPSIDE_PCT"),
+        ("min_gain", "POSITION_DRAWDOWN_MIN_GAIN_PCT"),
+        ("stop_loss", "POSITION_DRAWDOWN_STOP_LOSS_PCT"),
     ):
         raw = os.environ.get(env_name, "").strip()
         if raw:
@@ -161,11 +171,13 @@ def run(
     # Caller-provided thresholds take precedence over env.
     merged: Dict[str, float] = {**env_thresholds, **(thresholds or {})}
     logger.info(
-        "thresholds: warning=%s severe=%s critical=%s severe_upside=%s (source: %s)",
-        merged.get("warning", 10.0),
-        merged.get("severe", 20.0),
-        merged.get("critical", 30.0),
-        merged.get("severe_upside", 5.0),
+        "thresholds: drawdown(w=%s s=%s c=%s min_gain=%s) "
+        "stop_loss(line=%s) (source: %s)",
+        merged.get("warning", 20.0),
+        merged.get("severe", 50.0),
+        merged.get("critical", 80.0),
+        merged.get("min_gain", 5.0),
+        merged.get("stop_loss", 5.0),
         "cli+env" if (thresholds and env_thresholds) else ("cli" if thresholds else "env"),
     )
 
@@ -223,25 +235,31 @@ def main(argv: Optional[list] = None) -> int:
         "--warning",
         type=float,
         default=None,
-        help="警告档回撤阈值（默认 10）",
+        help="警告档回撤阈值（默认 20）",
     )
     parser.add_argument(
         "--severe",
         type=float,
         default=None,
-        help="严重档回撤阈值（默认 20）",
+        help="严重档回撤阈值（默认 50）",
     )
     parser.add_argument(
         "--critical",
         type=float,
         default=None,
-        help="危急档回撤阈值（默认 30）",
+        help="危急档回撤阈值（默认 80）",
     )
     parser.add_argument(
-        "--severe-upside",
+        "--min-gain",
         type=float,
         default=None,
-        help="剩余空间 < 该值时升级为严重档（默认 5）",
+        help="浮盈回撤预警的最低峰值浮盈（默认 5）",
+    )
+    parser.add_argument(
+        "--stop-loss",
+        type=float,
+        default=None,
+        help="跌破成本多少触发止损预警（默认 5，单档）",
     )
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="输出 debug 日志"
@@ -254,7 +272,9 @@ def main(argv: Optional[list] = None) -> int:
     )
 
     thresholds: Dict[str, float] = {}
-    for key in ("warning", "severe", "critical", "severe_upside"):
+    for key in (
+        "warning", "severe", "critical", "min_gain", "stop_loss",
+    ):
         v = getattr(args, key)
         if v is not None:
             thresholds[key] = v

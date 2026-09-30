@@ -272,7 +272,7 @@ jobs:
 
           # CLI 不再写本地文件（避免累积），通过 --report-file 把 markdown 落到 reports/ 目录
           # 供后续 actions/upload-artifact 抓取。本地跑不要传 --report-file。
-          REPORT_DATE=$(date -u +%F)
+          REPORT_DATE=$(date +%F)
           REPORT_FILE="reports/position-drawdown/${REPORT_DATE}.md"
           mkdir -p "$(dirname "$REPORT_FILE")"
 

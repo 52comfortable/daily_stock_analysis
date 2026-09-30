@@ -61,14 +61,12 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: 安装依赖（最小集，不含 LLM）
+      - name: 安装依赖（与 00-daily-analysis.yml 一致：完整 requirements.txt）
         run: |
           pip install --upgrade pip
-          # 回撤预警只用：数据获取 (efinance/akshare/yfinance) + 推送 (requests) + 配置 (dotenv)
-          # 不需要 LLM、不需要浏览器、不需要 Tushare
-          pip install \
-            pandas numpy pydantic requests python-dotenv \
-            efinance akshare yfinance
+          # 跟 00 一样装完整 requirements.txt —— 7-fetcher fallback 需要 tenacity/pytdx/tickflow/baostock/yfinance 全部就位，
+          # 之前手挑 8 个包在 EastMoney/Akshare 同时挂时无路可退，全 0 触发。
+          pip install -r requirements.txt
 
       - name: 创建必要目录
         run: |

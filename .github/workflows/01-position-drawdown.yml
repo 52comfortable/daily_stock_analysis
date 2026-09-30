@@ -53,6 +53,8 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    env:
+      TZ: Asia/Shanghai   # 全 job 用东八区时间，让 engine 的 date.today() 和 Longbridge end_date 都按 HKT/CST 解读
 
     steps:
       - name: 随机延迟（避免固定时间访问）

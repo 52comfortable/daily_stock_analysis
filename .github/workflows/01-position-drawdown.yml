@@ -74,35 +74,7 @@ jobs:
         run: |
           mkdir -p data logs reports
 
-      - name: 拉取持仓 Gist（如果配了 POSITION_DRAWDOWN_GIST_URL）
-        # POSITION_DRAWDOWN_GIST_URL 在 job-level env 里设过（含 vars||secrets fallback），
-        # 这里 env 上下文合法读取。注意 secrets.X 严禁出现在 if: 表达式里（GitHub 安全限制），
-        # 所以 if: 用 env.X（job env 已 inherit 给本 step）。
-        if: env.POSITION_DRAWDOWN_GIST_URL != ''
-        env:
-          GIST_URL: ${{ env.POSITION_DRAWDOWN_GIST_URL }}
-        run: |
-          # 直接给一个 raw URL 就行：https://gist.githubusercontent.com/<user>/<id>/raw/portfolio.json
-          # secret Gist 的 URL 本身就是 access token（32 位 hash），不需要 PAT
-          HTTP_STATUS=$(curl -s -o /tmp/portfolio.json -w "%{http_code}" "$GIST_URL")
-          if [ "$HTTP_STATUS" != "200" ]; then
-            echo "::error::Gist 拉取失败，HTTP $HTTP_STATUS。检查 POSITION_DRAWDOWN_GIST_URL 是否正确 / URL 里文件名是否叫 portfolio.json。"
-            cat /tmp/portfolio.json 2>/dev/null || true
-            exit 1
-          fi
-          if [ ! -s /tmp/portfolio.json ]; then
-            echo "::error::Gist 响应内容为空（HTTP 200 但 0 字节）"
-            exit 1
-          fi
-          # 简单校验：必须是 JSON 且有 positions 数组
-          if ! python -c "import json; d=json.load(open('/tmp/portfolio.json')); assert isinstance(d.get('positions'), list)" 2>/dev/null; then
-            echo "::error::Gist 内容不是合法 portfolio.json（需有顶层 positions 数组）"
-            cat /tmp/portfolio.json
-            exit 1
-          fi
-          echo ">>> 已从 Gist 拉取持仓 ($(wc -c < /tmp/portfolio.json) bytes)"
-
-      - name: 运行单只票回撤预警
+      - name: 运行持仓回撤预警
         env:
           # ==========================================
           # 通知渠道（与 00-daily-analysis.yml 保持一致；任一配置即生效）
@@ -180,12 +152,28 @@ jobs:
           POSITION_DRAWDOWN_CRITICAL_PCT_OVERRIDE: ${{ github.event.inputs.critical }}
 
         run: |
-          # 优先用 Gist 拉下来的 /tmp/portfolio.json；否则用 env 指定的本地路径
-          # 用 $POSITION_DRAWDOWN_GIST_URL（shell env，已带 vars||secrets fallback），
-          # 不要再用 ${{ vars.X }}，否则放 secrets 的 Gist URL 永远走不到这里。
-          if [ -n "$POSITION_DRAWDOWN_GIST_URL" ] && [ -s /tmp/portfolio.json ]; then
+          # 1) 决定持仓文件来源：优先 Gist，没有则用 env 指定的本地路径
+          #    Gist 拉到 /tmp/portfolio.json（job env 里已设过 $POSITION_DRAWDOWN_GIST_URL，
+          #    含 vars||secrets fallback —— raw URL 是 access token，常放 secrets）
+          if [ -n "$POSITION_DRAWDOWN_GIST_URL" ]; then
+            # 直接给一个 raw URL：https://gist.githubusercontent.com/<user>/<id>/raw/portfolio.json
+            HTTP_STATUS=$(curl -s -o /tmp/portfolio.json -w "%{http_code}" "$POSITION_DRAWDOWN_GIST_URL")
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "::error::Gist 拉取失败，HTTP $HTTP_STATUS。检查 POSITION_DRAWDOWN_GIST_URL 是否正确 / URL 里文件名是否叫 portfolio.json。"
+              cat /tmp/portfolio.json 2>/dev/null || true
+              exit 1
+            fi
+            if [ ! -s /tmp/portfolio.json ]; then
+              echo "::error::Gist 响应内容为空（HTTP 200 但 0 字节）"
+              exit 1
+            fi
+            if ! python -c "import json; d=json.load(open('/tmp/portfolio.json')); assert isinstance(d.get('positions'), list)" 2>/dev/null; then
+              echo "::error::Gist 内容不是合法 portfolio.json（需有顶层 positions 数组）"
+              cat /tmp/portfolio.json
+              exit 1
+            fi
             PORTFOLIO="/tmp/portfolio.json"
-            echo ">>> 持仓来源：Gist"
+            echo ">>> 持仓来源：Gist ($(wc -c < /tmp/portfolio.json) bytes)"
           else
             PORTFOLIO="$POSITION_DRAWDOWN_JSON_PATH"
             echo ">>> 持仓来源：本地文件 $PORTFOLIO"

@@ -1,0 +1,278 @@
+name: 单只票回撤预警
+
+on:
+  # 定时触发 - 每天北京时间 18:30 (UTC 10:30)，避开 18:00 的主分析
+  schedule:
+    - cron: '30 10 * * 1-5'    # 周一到周五，UTC 10:30 = 北京时间 18:30
+
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      portfolio_path:
+        description: '持仓 JSON 路径（默认 data/portfolio.json）'
+        required: false
+        default: 'data/portfolio.json'
+        type: string
+      dry_run:
+        description: 'dry-run：不真正推送，只打 markdown 预览'
+        required: false
+        default: false
+        type: boolean
+      warning:
+        description: '警告档回撤阈值 %'
+        required: false
+        default: '10.0'
+        type: string
+      severe:
+        description: '严重档回撤阈值 %'
+        required: false
+        default: '20.0'
+        type: string
+      critical:
+        description: '危急档回撤阈值 %'
+        required: false
+        default: '30.0'
+        type: string
+
+# 并发控制：错开主分析的 18:00 跑
+concurrency:
+  group: position-drawdown
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: 随机延迟（避免固定时间访问）
+        run: sleep $((RANDOM % 60))
+
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安装依赖（最小集，不含 LLM）
+        run: |
+          pip install --upgrade pip
+          # 回撤预警只用：数据获取 (efinance/akshare/yfinance) + 推送 (requests) + 配置 (dotenv)
+          # 不需要 LLM、不需要浏览器、不需要 Tushare
+          pip install \
+            pandas numpy pydantic requests python-dotenv \
+            efinance akshare yfinance
+
+      - name: 创建必要目录
+        run: |
+          mkdir -p data logs reports
+
+      - name: 拉取持仓 Gist（如果配了 POSITION_DRAWDOWN_GIST_URL）
+        if: vars.POSITION_DRAWDOWN_GIST_URL != ''
+        env:
+          GIST_URL: ${{ vars.POSITION_DRAWDOWN_GIST_URL }}
+        run: |
+          # 直接给一个 raw URL 就行：https://gist.githubusercontent.com/<user>/<id>/raw/portfolio.json
+          # secret Gist 的 URL 本身就是 access token（32 位 hash），不需要 PAT
+          HTTP_STATUS=$(curl -s -o /tmp/portfolio.json -w "%{http_code}" "$GIST_URL")
+          if [ "$HTTP_STATUS" != "200" ]; then
+            echo "::error::Gist 拉取失败，HTTP $HTTP_STATUS。检查 POSITION_DRAWDOWN_GIST_URL 是否正确 / URL 里文件名是否叫 portfolio.json。"
+            cat /tmp/portfolio.json 2>/dev/null || true
+            exit 1
+          fi
+          if [ ! -s /tmp/portfolio.json ]; then
+            echo "::error::Gist 响应内容为空（HTTP 200 但 0 字节）"
+            exit 1
+          fi
+          # 简单校验：必须是 JSON 且有 positions 数组
+          if ! python -c "import json; d=json.load(open('/tmp/portfolio.json')); assert isinstance(d.get('positions'), list)" 2>/dev/null; then
+            echo "::error::Gist 内容不是合法 portfolio.json（需有顶层 positions 数组）"
+            cat /tmp/portfolio.json
+            exit 1
+          fi
+          echo ">>> 已从 Gist 拉取持仓 ($(wc -c < /tmp/portfolio.json) bytes)"
+
+      - name: 运行单只票回撤预警
+        env:
+          # ==========================================
+          # 通知渠道（与 00-daily-analysis.yml 保持一致；任一配置即生效）
+          # ==========================================
+          # 企业微信 Webhook
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+          WECHAT_MSG_TYPE: ${{ vars.WECHAT_MSG_TYPE || secrets.WECHAT_MSG_TYPE || 'markdown' }}
+          # 飞书 Webhook
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+          FEISHU_WEBHOOK_KEYWORD: ${{ vars.FEISHU_WEBHOOK_KEYWORD || secrets.FEISHU_WEBHOOK_KEYWORD }}
+          # 钉钉 Webhook
+          DINGTALK_WEBHOOK_URL: ${{ secrets.DINGTALK_WEBHOOK_URL }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          # Telegram
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          # 邮件
+          EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVERS: ${{ vars.EMAIL_RECEIVERS || secrets.EMAIL_RECEIVERS }}
+          EMAIL_SENDER_NAME: ${{ vars.EMAIL_SENDER_NAME || secrets.EMAIL_SENDER_NAME || 'daily_stock_analysis股票分析助手' }}
+          # Pushover
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_API_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
+          # ntfy
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          # Gotify
+          GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
+          GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
+          # PushPlus
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          PUSHPLUS_TOPIC: ${{ vars.PUSHPLUS_TOPIC || secrets.PUSHPLUS_TOPIC }}
+          # 自定义 Webhook
+          CUSTOM_WEBHOOK_URLS: ${{ secrets.CUSTOM_WEBHOOK_URLS }}
+          CUSTOM_WEBHOOK_BEARER_TOKEN: ${{ secrets.CUSTOM_WEBHOOK_BEARER_TOKEN }}
+          CUSTOM_WEBHOOK_BODY_TEMPLATE: ${{ vars.CUSTOM_WEBHOOK_BODY_TEMPLATE || secrets.CUSTOM_WEBHOOK_BODY_TEMPLATE }}
+          WEBHOOK_VERIFY_SSL: ${{ vars.WEBHOOK_VERIFY_SSL || secrets.WEBHOOK_VERIFY_SSL || 'true' }}
+          # Discord
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_MAIN_CHANNEL_ID: ${{ secrets.DISCORD_MAIN_CHANNEL_ID }}
+          # 飞书云文档（App 模式）
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_FOLDER_TOKEN: ${{ secrets.FEISHU_FOLDER_TOKEN }}
+          FEISHU_CHAT_ID: ${{ vars.FEISHU_CHAT_ID || secrets.FEISHU_CHAT_ID }}
+          FEISHU_RECEIVE_ID_TYPE: ${{ vars.FEISHU_RECEIVE_ID_TYPE || secrets.FEISHU_RECEIVE_ID_TYPE }}
+          FEISHU_DOMAIN: ${{ vars.FEISHU_DOMAIN || secrets.FEISHU_DOMAIN }}
+          FEISHU_SEND_AS_FILE: ${{ vars.FEISHU_SEND_AS_FILE || secrets.FEISHU_SEND_AS_FILE }}
+          # AstrBot
+          ASTRBOT_URL: ${{ secrets.ASTRBOT_URL }}
+          ASTRBOT_TOKEN: ${{ secrets.ASTRBOT_TOKEN }}
+          # Server酱3
+          SERVERCHAN3_SENDKEY: ${{ secrets.SERVERCHAN3_SENDKEY }}
+          # Slack
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+
+          # ==========================================
+          # 持仓文件 + 阈值（全部走环境变量，不再传 CLI 参数）
+          # vars 提供可调默认值；user 改 vars 即可调整，无需改 workflow
+          # ==========================================
+          POSITION_DRAWDOWN_JSON_PATH: ${{ github.event.inputs.portfolio_path || vars.POSITION_DRAWDOWN_JSON_PATH || secrets.POSITION_DRAWDOWN_JSON_PATH || 'data/portfolio.json' }}
+          POSITION_DRAWDOWN_WARNING_PCT: ${{ github.event.inputs.warning || vars.POSITION_DRAWDOWN_WARNING_PCT || secrets.POSITION_DRAWDOWN_WARNING_PCT || '10.0' }}
+          POSITION_DRAWDOWN_SEVERE_PCT: ${{ github.event.inputs.severe || vars.POSITION_DRAWDOWN_SEVERE_PCT || secrets.POSITION_DRAWDOWN_SEVERE_PCT || '20.0' }}
+          POSITION_DRAWDOWN_CRITICAL_PCT: ${{ github.event.inputs.critical || vars.POSITION_DRAWDOWN_CRITICAL_PCT || secrets.POSITION_DRAWDOWN_CRITICAL_PCT || '30.0' }}
+          POSITION_DRAWDOWN_SEVERE_UPSIDE_PCT: ${{ vars.POSITION_DRAWDOWN_SEVERE_UPSIDE_PCT || secrets.POSITION_DRAWDOWN_SEVERE_UPSIDE_PCT || '5.0' }}
+          POSITION_DRAWDOWN_GIST_URL: ${{ vars.POSITION_DRAWDOWN_GIST_URL || secrets.POSITION_DRAWDOWN_GIST_URL || '' }}
+          # 临时覆盖阈值（手动触发时用）—— 通过 inputs 注入到环境变量
+          POSITION_DRAWDOWN_WARNING_PCT_OVERRIDE: ${{ github.event.inputs.warning }}
+          POSITION_DRAWDOWN_SEVERE_PCT_OVERRIDE: ${{ github.event.inputs.severe }}
+          POSITION_DRAWDOWN_CRITICAL_PCT_OVERRIDE: ${{ github.event.inputs.critical }}
+
+        run: |
+          # 优先用 Gist 拉下来的 /tmp/portfolio.json；否则用 env 指定的本地路径
+          if [ -n "${{ vars.POSITION_DRAWDOWN_GIST_URL }}" ] && [ -s /tmp/portfolio.json ]; then
+            PORTFOLIO="/tmp/portfolio.json"
+            echo ">>> 持仓来源：Gist"
+          else
+            PORTFOLIO="$POSITION_DRAWDOWN_JSON_PATH"
+            echo ">>> 持仓来源：本地文件 $PORTFOLIO"
+          fi
+
+          # 检查持仓文件存在
+          if [ ! -f "$PORTFOLIO" ]; then
+            echo "::warning::持仓文件 $PORTFOLIO 不存在，跳过本次预警。请把 portfolio.json 提交到 repo。"
+            echo "模板："
+            cat <<'EOF'
+          {
+            "version": 1,
+            "positions": [
+              { "code": "000776", "name": "广发证券", "cost_price": 10.00, "position_date": "2025-03-15" }
+            ]
+          }
+          EOF
+            exit 0
+          fi
+
+          # 检查至少配了一个通知渠道
+          if [ -z "$FEISHU_WEBHOOK_URL" ] && [ -z "$FEISHU_APP_ID" ] \
+             && [ -z "$WECHAT_WEBHOOK_URL" ] \
+             && [ -z "$DINGTALK_WEBHOOK_URL" ] \
+             && [ -z "$TELEGRAM_BOT_TOKEN" ] \
+             && [ -z "$DISCORD_WEBHOOK_URL" ] && [ -z "$DISCORD_BOT_TOKEN" ] \
+             && [ -z "$SLACK_WEBHOOK_URL" ] && [ -z "$SLACK_BOT_TOKEN" ] \
+             && [ -z "$EMAIL_SENDER" ] \
+             && [ -z "$PUSHOVER_USER_KEY" ] \
+             && [ -z "$NTFY_URL" ] \
+             && [ -z "$GOTIFY_URL" ] \
+             && [ -z "$PUSHPLUS_TOKEN" ] \
+             && [ -z "$CUSTOM_WEBHOOK_URLS" ] \
+             && [ -z "$ASTRBOT_URL" ] \
+             && [ -z "$SERVERCHAN3_SENDKEY" ]; then
+            echo "::warning::未配置任何通知渠道 secrets，将以 dry-run 模式运行（只生成报告）"
+            export POSITION_DRAWDOWN_DRY_RUN=true
+          fi
+
+          # 处理 dry_run 标志
+          DRY_FLAG=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            DRY_FLAG="--dry-run"
+            echo ">>> dry-run 模式：不真正推送"
+          fi
+
+          # 阈值通过环境变量传给 cli.run()，不传 CLI 参数
+          # （临时覆盖：inputs.warning 直接覆盖 POSITION_DRAWDOWN_WARNING_PCT）
+          [ -n "$POSITION_DRAWDOWN_WARNING_PCT_OVERRIDE" ] && export POSITION_DRAWDOWN_WARNING_PCT="$POSITION_DRAWDOWN_WARNING_PCT_OVERRIDE"
+          [ -n "$POSITION_DRAWDOWN_SEVERE_PCT_OVERRIDE" ] && export POSITION_DRAWDOWN_SEVERE_PCT="$POSITION_DRAWDOWN_SEVERE_PCT_OVERRIDE"
+          [ -n "$POSITION_DRAWDOWN_CRITICAL_PCT_OVERRIDE" ] && export POSITION_DRAWDOWN_CRITICAL_PCT="$POSITION_DRAWDOWN_CRITICAL_PCT_OVERRIDE"
+
+          echo ">>> 持仓文件: $PORTFOLIO"
+          echo ">>> 阈值: warning=$POSITION_DRAWDOWN_WARNING_PCT severe=$POSITION_DRAWDOWN_SEVERE_PCT critical=$POSITION_DRAWDOWN_CRITICAL_PCT"
+
+          # CLI 不再写本地文件（避免累积），通过 --report-file 把 markdown 落到 reports/ 目录
+          # 供后续 actions/upload-artifact 抓取。本地跑不要传 --report-file。
+          REPORT_DATE=$(date -u +%F)
+          REPORT_FILE="reports/position-drawdown/${REPORT_DATE}.md"
+          mkdir -p "$(dirname "$REPORT_FILE")"
+
+          python -m src.position_drawdown.cli \
+            --portfolio "$PORTFOLIO" \
+            --report-file "$REPORT_FILE" \
+            $DRY_FLAG
+
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: position-drawdown-${{ github.run_number }}
+          # 只传 markdown 报告。log 排查走 GitHub Actions job log（默认保留 90 天）。
+          path: reports/position-drawdown/
+          retention-days: 90
+          # 回撤脚本崩了 / 持仓文件缺 / 数据源全挂 时目录可能空着。
+          # 默认 v6 会把"0 文件"判成 error，让 job 翻红 —— 但那只是清理步骤，
+          # 真正的失败原因已经在前一步 exit 了。让这里静默成功，别污染 job 状态。
+          if-no-files-found: ignore
+
+      - name: 显示今日报告
+        if: always()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "📊 单只票回撤预警 · ${{ github.run_number }}"
+          echo "=========================================="
+          if [ -d "reports/position-drawdown" ] && [ "$(ls -A reports/position-drawdown 2>/dev/null)" ]; then
+            echo "生成的报告："
+            ls -la reports/position-drawdown/
+            LATEST=$(ls -t reports/position-drawdown/*.md 2>/dev/null | head -1)
+            if [ -n "$LATEST" ]; then
+              echo ""
+              echo "--- $LATEST ---"
+              cat "$LATEST"
+            fi
+          else
+            echo "⚠️ 未生成报告"
+          fi

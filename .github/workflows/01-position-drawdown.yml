@@ -71,12 +71,12 @@ jobs:
           mkdir -p data logs reports
 
       - name: 拉取持仓 Gist（如果配了 POSITION_DRAWDOWN_GIST_URL）
-        # 用 env.POSITION_DRAWDOWN_GIST_URL（不是 vars.X）：
-        # 上面 job-level env 块已经做了 vars||secrets||'' 的 fallback，
-        # 这里再读 vars.X 会漏掉放在 secrets 里的 Gist URL（那是常见配置，因为 raw URL 是 access token）。
-        if: env.POSITION_DRAWDOWN_GIST_URL != ''
+        # 这个 step 在「运行单只票回撤预警」step 之前，但 env 块是 step-scoped，
+        # 下一个 step 的 env.POSITION_DRAWDOWN_GIST_URL 在这里不可见。
+        # 所以 if/env 各自内联做一次 vars||secrets fallback：
+        if: ${{ vars.POSITION_DRAWDOWN_GIST_URL != '' || secrets.POSITION_DRAWDOWN_GIST_URL != '' }}
         env:
-          GIST_URL: ${{ env.POSITION_DRAWDOWN_GIST_URL }}
+          GIST_URL: ${{ vars.POSITION_DRAWDOWN_GIST_URL || secrets.POSITION_DRAWDOWN_GIST_URL || '' }}
         run: |
           # 直接给一个 raw URL 就行：https://gist.githubusercontent.com/<user>/<id>/raw/portfolio.json
           # secret Gist 的 URL 本身就是 access token（32 位 hash），不需要 PAT

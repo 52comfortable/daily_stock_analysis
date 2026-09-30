@@ -225,7 +225,8 @@ jobs:
             echo "模板："
             cat <<'EOF'
           {
-            "version": 1,
+            "description": "持仓清单",
+            "updated_at": "2026-09-30 18:30:00",
             "positions": [
               { "code": "000776", "name": "广发证券", "cost_price": 10.00, "position_date": "2025-03-15" }
             ]

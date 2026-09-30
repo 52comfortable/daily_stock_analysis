@@ -156,10 +156,14 @@ jobs:
           # Gist URL：raw URL 是 access token，常放 secrets。
           # env 块允许 secrets.X；放 step-level 因为现在 Gist 拉取已合并到 runner step 里。
           POSITION_DRAWDOWN_GIST_URL: ${{ vars.POSITION_DRAWDOWN_GIST_URL || secrets.POSITION_DRAWDOWN_GIST_URL || '' }}
-          # Longbridge 排第一：HK/A 股都有实时数据（Yfinance HK 有 1 天延迟）。
-          # 设 -1 抢到 efinance(0)/akshare(1)/pytdx(2)/tickflow(2)/.../tencent(5) 前面。
-          # 没配 LONGBRIDGE_* 时这个 fetcher 会静默跳过，fallback 链照常工作。
-          LONGBRIDGE_PRIORITY: '-1'
+          # Yfinance 垫底（P9，默认 4）。港股延迟 1 天，压到链尾可让 Longbridge
+          # 自动排到它前面（港股链变成 akshare → longbridge → yfinance）。
+          # A 股则让 Tencent(默认5) 排到它之前，多一个可用源。
+          YFINANCE_PRIORITY: '9'
+          # 不用调 LONGBRIDGE_PRIORITY：Yfinance 垫底后，Longbridge 无论取默认 5
+          # 还是更小的值，港股链路都相同；A 股链路里它排第 6 位，前面 5 个都是
+          # 纯 A 股源，正常时走不到，不会触发 "Cannot convert <code> to Longbridge
+          # symbol"（该 fetcher 只支持港股/美股，见 _to_longbridge_symbol）。
           # Longbridge Legacy 3 件套（APP_KEY / APP_SECRET / ACCESS_TOKEN）—— 凑齐就认
           LONGBRIDGE_APP_KEY: ${{ secrets.LONGBRIDGE_APP_KEY }}
           LONGBRIDGE_APP_SECRET: ${{ secrets.LONGBRIDGE_APP_SECRET }}

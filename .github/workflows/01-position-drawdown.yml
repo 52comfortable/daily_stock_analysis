@@ -43,6 +43,10 @@ jobs:
   check:
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # 提到 job-level：Gist step 在 runner step 之前，step-scoped env 不会往后传；
+    # job env 才会被所有 step 继承。同时这里可以引用 secrets.X（env 允许，if: 不允许）。
+    env:
+      POSITION_DRAWDOWN_GIST_URL: ${{ vars.POSITION_DRAWDOWN_GIST_URL || secrets.POSITION_DRAWDOWN_GIST_URL || '' }}
 
     steps:
       - name: 随机延迟（避免固定时间访问）
@@ -71,12 +75,12 @@ jobs:
           mkdir -p data logs reports
 
       - name: 拉取持仓 Gist（如果配了 POSITION_DRAWDOWN_GIST_URL）
-        # 这个 step 在「运行单只票回撤预警」step 之前，但 env 块是 step-scoped，
-        # 下一个 step 的 env.POSITION_DRAWDOWN_GIST_URL 在这里不可见。
-        # 所以 if/env 各自内联做一次 vars||secrets fallback：
-        if: ${{ vars.POSITION_DRAWDOWN_GIST_URL != '' || secrets.POSITION_DRAWDOWN_GIST_URL != '' }}
+        # POSITION_DRAWDOWN_GIST_URL 在 job-level env 里设过（含 vars||secrets fallback），
+        # 这里 env 上下文合法读取。注意 secrets.X 严禁出现在 if: 表达式里（GitHub 安全限制），
+        # 所以 if: 用 env.X（job env 已 inherit 给本 step）。
+        if: env.POSITION_DRAWDOWN_GIST_URL != ''
         env:
-          GIST_URL: ${{ vars.POSITION_DRAWDOWN_GIST_URL || secrets.POSITION_DRAWDOWN_GIST_URL || '' }}
+          GIST_URL: ${{ env.POSITION_DRAWDOWN_GIST_URL }}
         run: |
           # 直接给一个 raw URL 就行：https://gist.githubusercontent.com/<user>/<id>/raw/portfolio.json
           # secret Gist 的 URL 本身就是 access token（32 位 hash），不需要 PAT
@@ -170,7 +174,6 @@ jobs:
           POSITION_DRAWDOWN_SEVERE_PCT: ${{ github.event.inputs.severe || vars.POSITION_DRAWDOWN_SEVERE_PCT || secrets.POSITION_DRAWDOWN_SEVERE_PCT || '20.0' }}
           POSITION_DRAWDOWN_CRITICAL_PCT: ${{ github.event.inputs.critical || vars.POSITION_DRAWDOWN_CRITICAL_PCT || secrets.POSITION_DRAWDOWN_CRITICAL_PCT || '30.0' }}
           POSITION_DRAWDOWN_SEVERE_UPSIDE_PCT: ${{ vars.POSITION_DRAWDOWN_SEVERE_UPSIDE_PCT || secrets.POSITION_DRAWDOWN_SEVERE_UPSIDE_PCT || '5.0' }}
-          POSITION_DRAWDOWN_GIST_URL: ${{ vars.POSITION_DRAWDOWN_GIST_URL || secrets.POSITION_DRAWDOWN_GIST_URL || '' }}
           # 临时覆盖阈值（手动触发时用）—— 通过 inputs 注入到环境变量
           POSITION_DRAWDOWN_WARNING_PCT_OVERRIDE: ${{ github.event.inputs.warning }}
           POSITION_DRAWDOWN_SEVERE_PCT_OVERRIDE: ${{ github.event.inputs.severe }}

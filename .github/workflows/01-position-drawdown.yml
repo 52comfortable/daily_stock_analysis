@@ -64,7 +64,14 @@ jobs:
       - name: 设置 Python 环境
         uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          # 用 3.12 而非 00-workflow 的 3.11：requirements.txt 里 Longbridge 的
+          # 条件表达式是 `longbridge==0.2.74; Linux and python_version < "3.12"`，
+          # 3.11 会装到 0.2.74，而它在 LONGBRIDGE_REGION=cn 下的
+          # history_candlesticks 仍返回空日线（QuoteContext 能建但取不到数据）。
+          # 3.12 走 `longbridge>=4.0.5`，与本地验证通过的版本一致。
+          # GitHub Actions 的 ubuntu-24.04 是 glibc 2.39，满足 4.x wheel 要求
+          # （该限制只影响项目 Dockerfile 用的 bookworm/glibc 2.36）。
+          python-version: '3.12'
           cache: 'pip'
 
       - name: 安装依赖（与 00-daily-analysis.yml 一致：完整 requirements.txt）
@@ -166,10 +173,11 @@ jobs:
           # （该 fetcher 只支持港股/美股，见 _to_longbridge_symbol）。
           # Longbridge 接入点：必须显式设为 cn。
           # SDK 自动判断（region=auto）在部分网络下会落回 .com 国际端点，
-          # 其 WebSocket 连不上 → QuoteContext 9 秒后 "context dropped"，
+          # 其 WebSocket 连不上 → QuoteContext 若干秒后 "context dropped"，
           # 连纯 HTTP 的 history_candlesticks 也一起挂掉（都挂在 QuoteContext 上）。
-          # 设为 cn 走 openapi.longbridge.cn / openapi-quote.longbridge.cn，
-          # 实测 _get_ctx() 0.0s 返回，美股港股日线均正常。
+          # 设为 cn 走 openapi.longbridge.cn / openapi-quote.longbridge.cn。
+          # 注意：region 生效后 SDK 0.2.74 仍返回空日线，必须配合上面的
+          # python-version 3.12（SDK 4.x）才完全可用。
           # 官方文档：https://open.longbridge.com/zh-CN/docs/getting-started#api-host
           LONGBRIDGE_REGION: 'cn'
           # Longbridge Legacy 3 件套（APP_KEY / APP_SECRET / ACCESS_TOKEN）—— 凑齐就认

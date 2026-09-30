@@ -71,9 +71,12 @@ jobs:
           mkdir -p data logs reports
 
       - name: 拉取持仓 Gist（如果配了 POSITION_DRAWDOWN_GIST_URL）
-        if: vars.POSITION_DRAWDOWN_GIST_URL != ''
+        # 用 env.POSITION_DRAWDOWN_GIST_URL（不是 vars.X）：
+        # 上面 job-level env 块已经做了 vars||secrets||'' 的 fallback，
+        # 这里再读 vars.X 会漏掉放在 secrets 里的 Gist URL（那是常见配置，因为 raw URL 是 access token）。
+        if: env.POSITION_DRAWDOWN_GIST_URL != ''
         env:
-          GIST_URL: ${{ vars.POSITION_DRAWDOWN_GIST_URL }}
+          GIST_URL: ${{ env.POSITION_DRAWDOWN_GIST_URL }}
         run: |
           # 直接给一个 raw URL 就行：https://gist.githubusercontent.com/<user>/<id>/raw/portfolio.json
           # secret Gist 的 URL 本身就是 access token（32 位 hash），不需要 PAT
@@ -175,7 +178,9 @@ jobs:
 
         run: |
           # 优先用 Gist 拉下来的 /tmp/portfolio.json；否则用 env 指定的本地路径
-          if [ -n "${{ vars.POSITION_DRAWDOWN_GIST_URL }}" ] && [ -s /tmp/portfolio.json ]; then
+          # 用 $POSITION_DRAWDOWN_GIST_URL（shell env，已带 vars||secrets fallback），
+          # 不要再用 ${{ vars.X }}，否则放 secrets 的 Gist URL 永远走不到这里。
+          if [ -n "$POSITION_DRAWDOWN_GIST_URL" ] && [ -s /tmp/portfolio.json ]; then
             PORTFOLIO="/tmp/portfolio.json"
             echo ">>> 持仓来源：Gist"
           else

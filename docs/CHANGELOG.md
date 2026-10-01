@@ -24,6 +24,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [新功能] Web/API runtime scheduler 硬超时后扫描已落库分析历史，**默认发送**部分完成通知（`DSA_TIMEOUT_PARTIAL_NOTIFY` 未设置或为 true；此前超时不推送已落库个股），并在 `last_error` 中记录 `completed/pending` 摘要；可用 `DSA_TIMEOUT_PARTIAL_NOTIFY=false` 关闭推送（Refs #2328）。
 - [测试] 修复股票名称解析冷启动超时并发测试的同步竞态：在放行后台抓取前确认两个等待者均已结束并返回空结果，避免 Docker 发布门禁偶发失败。
 - [文档] 将仓库内所有 SerpApi 链接统一更新为新的赞助转化追踪地址。
+- [修复] Codex 问股将当前激活的交易 Skill 指令传入最终请求，保留会话继承、显式清空及默认技能语义；限定在三个已保存数据工具内执行，缺失数据或能力时明确披露。
 - [修复] 智能导入兼容带 UTF-8 BOM 的 CSV 与剪贴板文本，避免 `code` 表头被误当成数据并丢失有效股票代码。
 - [修复] 为 AkShare 大盘涨跌统计的东财与新浪降级调用增加可强制终止的子进程超时，避免外部接口无响应时长期占用分析线程（Fixes #2340）。
 

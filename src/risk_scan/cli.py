@@ -233,9 +233,16 @@ def run(
                 include_news=with_news, include_topics=with_news,
                 include_earnings=with_earnings,
             )
+            # 覆盖清单要打出来：只报"覆盖 N 只"时无法判断长桥到底支持哪些
+            # 市场，是 A 股资讯真为空、还是调用失败，光看计数分不出来。
+            covered = sorted(lb_rows)
             logger.info(
-                "长桥通道取回 %d 条（覆盖 %d 只）",
-                sum(len(v) for v in lb_rows.values()), len(lb_rows),
+                "长桥通道取回 %d 条（覆盖 %d 只：%s）",
+                sum(len(v) for v in lb_rows.values()),
+                len(covered),
+                "、".join(
+                    f"{names.get(c, '')}({c})" if names.get(c) else c for c in covered
+                ) or "无",
             )
             for code, rows in lb_rows.items():
                 announcements.setdefault(code, []).extend(rows)

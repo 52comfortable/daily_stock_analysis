@@ -725,6 +725,42 @@ def _fmt_amount(value: float) -> str:
     return f"{value:.0f}"
 
 
+def _lb_symbol(code: str) -> Optional[str]:
+    """持仓代码 → 长桥 symbol。**长桥不支持的返回 None，调用方应跳过。**
+
+    实测（SDK 4.5.0 / REGION=cn / 真实凭证）：
+
+    ==========  ==============  ==========================
+    持仓代码    长桥接受的写法   备注
+    ==========  ==============  ==========================
+    ``603773``  ``603773.SH``   6xx 与 688（科创板）→ 上交所
+    ``000993``  ``000993.SZ``   0xx / 3xx → 深交所
+    ``06166.HK`` 原样           港股本来就带后缀
+    ``920002``  无              北交所，长桥不收录
+    ==========  ==============  ==========================
+
+    **必须带后缀，而且只能后置**。``SH603773`` / ``603773.SS`` / ``603773.CN``
+    都不认（实测 400 symbol not found）。
+
+    最坑的是 ``corp_action``：传裸码时它**不报错、静默返回 0 条**，
+    看起来像"这家公司没有财报记录"，实际是根本没查到 —— 曾导致 A 股的
+    连续亏损检测完全失效（带后缀后同一只票能返回 29~127 条）。
+    """
+    text = str(code or "").strip().upper()
+    if not text:
+        return None
+    if "." in text:
+        return text  # 已带市场后缀（.HK 等），原样送
+    if not (len(text) == 6 and text.isdigit()):
+        return None
+    head = text[0]
+    if head == "6":            # 含 688 科创板
+        return f"{text}.SH"
+    if head in ("0", "3"):     # 深市主板 / 创业板
+        return f"{text}.SZ"
+    return None                # 920xxx 北交所：长桥不收录
+
+
 def fetch_longbridge(
     codes: Iterable[str],
     *,
@@ -781,6 +817,11 @@ def fetch_longbridge(
         if not key:
             continue
         display = name_map.get(key, key)
+        symbol = _lb_symbol(key)
+        if symbol is None:
+            # 长桥不收录的市场（如北交所）：不发那个注定被拒的请求
+            logger.debug("长桥不收录 %s(%s)，跳过", key, display)
+            continue
         rows: List[Announcement] = []
         want_news = include_news and (
             not hk_news_only or key.upper().endswith(".HK")
@@ -789,7 +830,7 @@ def fetch_longbridge(
         if want_news and cc is not None:
             _throttle()
             try:
-                for item in (cc.news(key) or [])[:max_news]:
+                for item in (cc.news(symbol) or [])[:max_news]:
                     rows.append(Announcement(
                         code=key, name=display, title=item.title or "",
                         publish_date=_lb_date(item.published_at),
@@ -802,7 +843,7 @@ def fetch_longbridge(
         if want_news and include_topics and cc is not None:
             _throttle()
             try:
-                for item in (cc.topics(key) or []):
+                for item in (cc.topics(symbol) or []):
                     text = item.description or ""
                     if not _is_negative_sentiment(text):
                         continue
@@ -820,7 +861,7 @@ def fetch_longbridge(
 
         if include_earnings and fc is not None:
             _throttle()
-            rows.extend(_earnings_loss_events(fc, key, display))
+            rows.extend(_earnings_loss_events(fc, symbol, display))
 
         if rows:
             rows.sort(key=lambda a: a.publish_date, reverse=True)

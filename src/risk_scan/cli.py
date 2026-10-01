@@ -218,6 +218,10 @@ def run(
         print(f"ERROR: 公告抓取失败: {exc}", file=sys.stderr)
         return 4
 
+    # 抓取阶段记录的整条通道故障。必须一路带到报告里 —— 通道整条挂掉时
+    # 受影响的标的只会显示「无风险事件」，光看逐只结果发现不了。
+    channel_errors: List[str] = []
+
     # ── 通道二：长桥（资讯/社区情绪/财报，全市场）──
     lb_rows: Dict[str, Any] = {}
     if with_news or with_earnings:
@@ -237,6 +241,7 @@ def run(
                 announcements.setdefault(code, []).extend(rows)
         except Exception as exc:  # noqa: BLE001 - 补充通道，失败不影响主判定
             logger.warning("长桥通道失败（不影响公告判定）: %s", exc)
+            channel_errors.append(f"长桥通道不可用，港股无外部信号：{exc}")
 
     # ── LLM 兜底判定（可选，失败不影响主流程）──
     triage: Optional[Dict[Any, Any]] = None
@@ -258,6 +263,7 @@ def run(
         window_end=end,
         mitigation_tiers=tiers,
         triage=triage,
+        channel_errors=channel_errors,
     )
     _print_text_summary(report)
 

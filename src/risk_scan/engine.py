@@ -795,11 +795,17 @@ def evaluate_holdings(
     mitigation_tiers: int = 2,
     st_floor: RiskLevel = RiskLevel.WARNING,
     triage: Optional[Dict[Any, TriageResult]] = None,
+    channel_errors: Optional[List[str]] = None,
 ) -> RiskReport:
     """对整个持仓清单做排雷判定。
 
     ``portfolio`` 需含顶层 ``positions`` 数组（与 ``src.position_drawdown``
     使用的是同一个 ``data/portfolio.json`` 契约）。
+
+    ``channel_errors`` 是抓取阶段记录的**整条通道故障**（如长桥凭证缺失）。
+    必须显式传进来落到报告里：一条通道整条挂掉时，受影响的标的会显示
+    「无风险事件」—— 这正是"把没查到说成没事"这个最危险的失败模式，
+    光看逐只结果发现不了。
     """
     as_of_date = as_of or date.today()
     covered, report_uncovered = split_coverage(portfolio)
@@ -813,6 +819,7 @@ def evaluate_holdings(
             "st_floor": st_floor.label,
         },
         uncovered=report_uncovered,
+        errors=list(channel_errors or []),
     )
 
     for code, name in covered:

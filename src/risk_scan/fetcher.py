@@ -300,8 +300,15 @@ def fetch_announcements(
             time.sleep(delay)
 
     if skipped:
+        # 关键：必须回填**空列表**而不是留空。
+        # 留空的话下游 `announcements.get(code)` 拿到 None，无法区分
+        # 「查了但失败」和「这本就不该查（纯港股）」，会把它误报成
+        # 「未获取到公告数据（抓取失败）」—— 明明是设计如此，却报成故障。
+        # 两者在字典里的区分：None = 查了失败；[] = 查了/不适用，都不是故障。
+        for code in skipped:
+            results[code] = []
         logger.debug(
-            "巨潮通道跳过 %d 个非 A 股代码（由舆情通道覆盖）: %s",
+            "巨潮通道跳过 %d 个非 A 股代码（由长桥通道覆盖）: %s",
             len(skipped), "、".join(skipped),
         )
 
@@ -615,7 +622,10 @@ def _lb_contexts():
         cfg = lbo.Config.from_apikey_env()
         return lbo.ContentContext(cfg), lbo.FundamentalContext(cfg)
     except Exception as exc:  # noqa: BLE001 - 缺凭证/SDK 未装都走这里
-        logger.info("长桥通道不可用，跳过: %s", exc)
+        # 用 warning 而非 info：这是**故障**，不是正常降级。CI 里最常见的
+        # 成因是 workflow 漏传 LONGBRIDGE_APP_KEY，表现为长桥整条 0 条而
+        # 港股照常显示「无风险事件」—— 光看逐只结果发现不了。
+        logger.warning("长桥通道不可用: %s", exc)
         return None, None
 
 
@@ -746,7 +756,14 @@ def fetch_longbridge(
     """
     cc, fc = _lb_contexts()
     if cc is None and fc is None:
-        return {}
+        # 凭证缺失/SDK 未装 → **显式抛错**，不要静默返回 {}。
+        # 静默返回会让港股照常显示「无风险事件」，报告里看不出任何异常，
+        # 这正是"把没查到说成没事"这个最危险的失败模式。抛出去由调用方
+        # 记进报告的「数据异常」段。
+        raise RuntimeError(
+            "长桥通道不可用（凭证缺失或 longbridge 未安装）。"
+            "检查 workflow 是否传入 LONGBRIDGE_APP_KEY / APP_SECRET / ACCESS_TOKEN。"
+        )
 
     name_map = names or {}
     hk_news_only = str(news_markets or "").strip().upper() in ("HK", "港股")

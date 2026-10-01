@@ -59,8 +59,14 @@ jobs:
       - name: 设置 Python 环境
         uses: actions/setup-python@v6
         with:
-          # 与 01-position-drawdown.yml 一致用 3.12：akshare 在 3.11 上
-          # 依赖的 numpy/pandas 组合与 requirements.txt 的条件表达式不匹配。
+          # 与 01-position-drawdown.yml 一致用 3.12，别跟 00-workflow 对齐成 3.11。
+          # 两条硬约束，任一条破了都会**静默**降级、不报错：
+          #   1) requirements.txt 里 longbridge==0.2.74 锁 python_version < "3.12"，
+          #      3.11 会装到 0.2.74；它在 LONGBRIDGE_REGION=cn 下 ContentContext
+          #      仍返回空 —— 港股信号全丢，日志只显示"取回 0 条"。
+          #   2) 3.12 才走 longbridge>=4.0.5（Linux wheel 需 manylinux_2_39，
+          #      ubuntu-24.04 的 glibc 2.39 满足）。
+          # 另外 akshare 在 3.11 上的 numpy/pandas 组合也与条件表达式不匹配。
           python-version: '3.12'
           cache: 'pip'
 
@@ -156,8 +162,20 @@ jobs:
           # 两边本来读的就是同一份 portfolio.json。
           # raw URL 本身是访问令牌，属敏感信息，放 secrets。
           POSITION_DRAWDOWN_GIST_URL: ${{ vars.POSITION_DRAWDOWN_GIST_URL || secrets.POSITION_DRAWDOWN_GIST_URL || '' }}
-          # 长桥通道开关。关掉后港股资讯与社区情绪、财报口径全部不跑。
+          # 长桥通道开关。关掉后资讯、社区情绪、财报口径全部不跑 ——
+          # 港股将完全无外部信号。
           RISK_SCAN_WITH_NEWS: ${{ github.event.inputs.with_news && '1' || vars.RISK_SCAN_WITH_NEWS || '1' }}
+          # ── 长桥（港股资讯/社区情绪 + 全市场财报口径的唯一来源）──
+          # 接入点必须显式设为 cn，不能用 ${{ vars.LONGBRIDGE_REGION }}：
+          # SDK 自动判断（region=auto）在部分网络下会落回 .com 国际端点。
+          # 与 01-position-drawdown.yml 保持一致，官方文档：
+          # https://open.longbridge.com/zh-CN/docs/getting-started#api-host
+          LONGBRIDGE_REGION: 'cn'
+          # Legacy 3 件套（APP_KEY / APP_SECRET / ACCESS_TOKEN），与 01 相同。
+          # 缺任何一个，SDK 抛 "missing environment variable"，整个长桥通道空转。
+          LONGBRIDGE_APP_KEY: ${{ secrets.LONGBRIDGE_APP_KEY }}
+          LONGBRIDGE_APP_SECRET: ${{ secrets.LONGBRIDGE_APP_SECRET }}
+          LONGBRIDGE_ACCESS_TOKEN: ${{ secrets.LONGBRIDGE_ACCESS_TOKEN }}
           # ── LLM 兜底通道 ──
           LLM_MINIMAX_API_KEY: ${{ secrets.LLM_MINIMAX_API_KEY }}
           LLM_MINIMAX_BASE_URL: ${{ vars.LLM_MINIMAX_BASE_URL || secrets.LLM_MINIMAX_BASE_URL }}

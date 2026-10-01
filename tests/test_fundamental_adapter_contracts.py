@@ -234,3 +234,71 @@ def test_forecast_text_does_not_fall_back_to_announcement_or_numeric_change(monk
     ))
     result = AkshareFundamentalAdapter().get_fundamental_bundle("600519")
     assert result["earnings"] == ({"forecast_summary": expected} if expected else {})
+
+
+@pytest.mark.parametrize("metrics", [
+    ["营业总收入同比增长率", "净利润同比增长率", "营业总收入", "归母净利润",
+     "经营活动产生的现金流量净额", "净资产收益率", "销售毛利率"],
+    ["营业总收入同比增长(%)", "归属净利润同比增长(%)", "营业总收入(元)", "归属净利润(元)",
+     "经营活动产生的现金流量净额(元)", "净资产收益率(%)", "销售毛利率(%)"],
+    ["营业总收入同比增长(%)", "归属净利润同比增长(%)", "营业总收入(元)", "归属净利润(元)",
+     "经营现金流量净额(元)", "净资产收益率(加权)(%)", "销售毛利率(%)"],
+])
+def test_financial_abstract_wide_table_uses_latest_period_and_exact_metrics(monkeypatch, metrics):
+    table = pd.DataFrame({
+        "选项": ["成长能力"] * 7,
+        "指标": metrics,
+        "20250331": [99] * 7,
+        "20260630": [0, -5, 1000, 120, 80, 12, 30],
+        "20260331": [88] * 7,
+    })
+    monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(stock_financial_abstract=lambda symbol: table))
+    result = AkshareFundamentalAdapter().get_fundamental_bundle("600519")
+    assert result["growth"] == {"revenue_yoy": 0, "net_profit_yoy": -5, "roe": 12, "gross_margin": 30}
+    assert result["earnings"]["financial_report"] == {
+        "report_date": "2026-06-30", "revenue": 1000, "net_profit_parent": 120,
+        "operating_cash_flow": 80, "roe": 12,
+    }
+    assert result["status"] == "partial"
+    assert result["source_chain"] == ["growth:stock_financial_abstract"]
+
+
+@pytest.mark.parametrize("value", [None, float("nan"), float("inf"), "--"])
+@pytest.mark.parametrize("metric", ["营业总收入", "营业总收入(元)"])
+def test_empty_financial_abstract_is_not_success(monkeypatch, value, metric):
+    monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(
+        stock_financial_abstract=lambda symbol: pd.DataFrame({"指标": [metric], "20260630": [value]}),
+    ))
+    result = AkshareFundamentalAdapter().get_fundamental_bundle("600519")
+    assert result["growth"] == {}
+    assert result["earnings"] == {}
+    assert result["source_chain"] == []
+    assert result["status"] == "not_supported"
+
+
+@pytest.mark.parametrize("metrics", [
+    ["营业总收入同比增长率", "归母净利润同比增长率"],
+    ["营业总收入同比增长(%)", "归属净利润同比增长(%)"],
+])
+def test_financial_abstract_growth_does_not_fill_missing_amounts(monkeypatch, metrics):
+    monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(
+        stock_financial_abstract=lambda symbol: pd.DataFrame({
+            "指标": metrics, "20260630": [20, -10],
+        }),
+    ))
+    result = AkshareFundamentalAdapter().get_fundamental_bundle("600519")
+    assert result["growth"]["revenue_yoy"] == 20
+    assert result["growth"]["net_profit_yoy"] == -10
+    assert result["earnings"] == {}
+
+
+@pytest.mark.parametrize("metric", ["营业总收入", "营业总收入(元)"])
+def test_financial_abstract_does_not_backfill_older_period(monkeypatch, metric):
+    monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(
+        stock_financial_abstract=lambda symbol: pd.DataFrame({
+            "指标": [metric], "20260630": [None], "20260331": [1000],
+        }),
+    ))
+    result = AkshareFundamentalAdapter().get_fundamental_bundle("600519")
+    assert result["earnings"] == {}
+    assert result["status"] == "not_supported"

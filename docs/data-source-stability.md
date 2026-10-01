@@ -239,6 +239,14 @@ LONGBRIDGE_ACCESS_TOKEN=your_access_token
 4. 批量任务限速策略：对免费源自动降低并发，优先复用本地日线缓存，减少触发上游限流。
 5. 可选商业源接入：只有在现有 Tushare / TickFlow / Longbridge / Finnhub / AlphaVantage 仍不能覆盖需求时，再考虑新增 Twelve Data、Massive/Polygon、Nasdaq Data Link 等源。
 
+## 财务摘要表结构
+
+AkShare `stock_financial_abstract` 返回“指标行 + 报告期列”的宽表。适配层选取最新有效报告期列，以明确的指标名读取收入、归母净利润、经营现金流、同比增长率、ROE 和毛利率。同比百分比不能填入金额字段；缺失值保持缺失，不跨报告期补值。仅有报告日期或全部指标为空时，不标记财务数据成功。普通行表仍沿用现有解析路径。
+
+指标别名兼容上游带单位的名称，包括 `营业总收入(元)`、`归属净利润(元)`、`营业总收入同比增长(%)`、`归属净利润同比增长(%)`、`经营现金流量净额(元)`、`净资产收益率(加权)(%)` 和 `销售毛利率(%)`；仍按完整名称精确匹配，避免混淆金额、百分比与不同口径的指标。
+
+接口形状参考 [AkShare 官方文档](https://akshare.akfamily.xyz/data/stock/stock.html)。本节为中文专题说明，没有对应英文文档。
+
 ## 官方资料
 
 - Tushare: https://tushare.pro/document/2

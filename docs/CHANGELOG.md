@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 - [修复] `REPORT_LANGUAGE=en` 时个股决策仪表盘的 system/user prompt 改用完整英文模板（`ko` 复用英文骨架并保留韩文输出指令），不再在中文模板末尾追加英文约束，避免本地小模型（如 `ollama/qwen3:14b`）受主语言影响仍输出中文；JSON 键名、`decision_type`/`action` 枚举与解析契约不变，中文模板保持逐字不变（Fixes #2352）。
 
 - [修复] 基本面适配按明确报告期调用 AkShare 业绩预告、快报及机构持股，修正十大股东市场代码并限制结果为目标股票；按真实指标生成快报摘要，避免旧默认日期、公告日期冒充摘要和跨指标错误降级。
+- [修复] 基本面财务摘要按“指标行 + 报告期列”解析最新报告期，兼容 AkShare 带单位的指标名及“归属净利润”口径，区分同比百分比与财务金额；全空指标和仅日期的结果不再标记成功，不跨报告期补值。
 
 - [修复] 桌面后端打包完整收集 MiniRacer 原生运行文件，并在 Windows/macOS 冻结产物中实际执行 JavaScript，防止筹码分布因漏包或版本错配永久失败。
 

@@ -1,14 +1,11 @@
 name: 持仓排雷监控
 
 on:
-  # 定时触发 - 每天北京时间 22:30 (UTC 14:30)
-  # 刻意排在持仓预警(18:30)之后：A股公告绝大多数在盘后 15:00-22:00 发布，
-  # 17:30 跑会漏掉当天晚上那批最要紧的。22:30 能覆盖当天绝大部分。
-  # 漏掉的 22:00-24:00 极少数也不真丢 —— 扫描窗口 180 天滚动，次日补上。
+  # 每天北京时间 22:30 (UTC 14:30)，排在持仓预警(18:30)之后：A股公告多在
+  # 盘后 15:00-22:00 发布。漏掉的次日由 180 天滚动窗口补上。
   schedule:
     - cron: '30 14 * * 1-5'    # 周一到周五，UTC 14:30 = 北京时间 22:30
 
-  # 手动触发
   workflow_dispatch:
     inputs:
       portfolio_path:
@@ -37,7 +34,7 @@ on:
         default: false
         type: boolean
 
-# 并发控制：与持仓预警错开，避免同时打巨潮
+# 与持仓预警错开并发，避免同时打巨潮
 concurrency:
   group: risk-scan
   cancel-in-progress: false
@@ -59,36 +56,24 @@ jobs:
       - name: 设置 Python 环境
         uses: actions/setup-python@v6
         with:
-          # 与 01-position-drawdown.yml 一致用 3.12，别跟 00-workflow 对齐成 3.11。
-          # 两条硬约束，任一条破了都会**静默**降级、不报错：
-          #   1) requirements.txt 里 longbridge==0.2.74 锁 python_version < "3.12"，
-          #      3.11 会装到 0.2.74；它在 LONGBRIDGE_REGION=cn 下 ContentContext
-          #      仍返回空 —— 港股信号全丢，日志只显示"取回 0 条"。
-          #   2) 3.12 才走 longbridge>=4.0.5（Linux wheel 需 manylinux_2_39，
-          #      ubuntu-24.04 的 glibc 2.39 满足）。
-          # 另外 akshare 在 3.11 上的 numpy/pandas 组合也与条件表达式不匹配。
+          # 必须 3.12（同 01）：3.11 会装 longbridge==0.2.74，它在 REGION=cn 下
+          # ContentContext 恒返回空，港股信号全丢且不报错。
           python-version: '3.12'
           cache: 'pip'
 
       - name: 安装依赖
         run: |
           pip install --upgrade pip
-          # 排雷只用 akshare + requests + pandas，但复用完整 requirements.txt
-          # 保持与其它 workflow 一致，避免依赖解析差异导致行为不一致。
+          # 复用完整 requirements.txt，与其它 workflow 保持一致的依赖解析。
           pip install -r requirements.txt
 
       - name: 创建必要目录
         run: |
           mkdir -p data logs reports
 
-      # ── 跨运行状态（事件指纹去重）──
-      # GitHub Actions runner 是一次性的，两次运行之间没有磁盘。要回答
-      # "我有没有告诉过你了"，必须记住一点东西。
-      #
-      # 取：key 故意只写前缀，精确匹配必然失败 → 回落到前缀匹配 → 拿到
-      #     最近一次创建的那份。
-      # 存：key 必须每次唯一（run_id + run_attempt，Re-run 时 run_id 不变）。
-      #     同名 key 不可覆盖，存两次会直接报错。
+      # 跨运行状态（事件指纹去重）。runner 一次性，两次运行间无磁盘。
+      # 取：restore 的 key 只写前缀，靠前缀匹配拿最近一次。
+      # 存：save 的 key 必须带 run_id+run_attempt，否则 Re-run 会因同名报错。
       - name: 取回上次状态（跨运行去重）
         id: state-restore
         uses: actions/cache/restore@v4
@@ -98,9 +83,7 @@ jobs:
 
       - name: 运行持仓排雷
         env:
-          # ==========================================
-          # 通知渠道（与 00/01 workflow 保持一致；任一配置即生效）
-          # ==========================================
+          # 通知渠道（与 00/01 一致，任一配置即生效）
           WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
           WECHAT_MSG_TYPE: ${{ vars.WECHAT_MSG_TYPE || secrets.WECHAT_MSG_TYPE || 'markdown' }}
           FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
@@ -144,49 +127,217 @@ jobs:
           SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
           SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
 
-          # ==========================================
-          # 排雷参数（走环境变量，不传 CLI 参数；改 vars 即可调整）
-          # ==========================================
+          # 排雷参数（走环境变量，改 vars 即可调整）
           RISK_SCAN_JSON_PATH: ${{ github.event.inputs.portfolio_path || vars.RISK_SCAN_JSON_PATH || 'data/portfolio.json' }}
           RISK_SCAN_WINDOW_DAYS: ${{ github.event.inputs.window_days || vars.RISK_SCAN_WINDOW_DAYS || '180' }}
-          # 推送门槛：全绿日不推送，避免每天一条"今天没有雷"把通知渠道磨没。
-          # 想让关注档（WATCH）也推，改成 watch。
+          # 全绿日不推送，免得每天一条"今天没有雷"把通知渠道磨没。
           RISK_SCAN_PUSH_MIN_LEVEL: ${{ github.event.inputs.push_min_level || vars.RISK_SCAN_PUSH_MIN_LEVEL || 'warning' }}
-          # 缓解事件（结案 / 摘帽 / 处罚决定书）结算同类别风险时下调几级
           RISK_SCAN_MITIGATION_TIERS: ${{ vars.RISK_SCAN_MITIGATION_TIERS || '2' }}
-          # 跨运行状态文件路径（由上面的 actions/cache 负责在运行之间传递）
           RISK_SCAN_STATE_PATH: data/risk_scan_state.json
-          # 持仓来源：Gist（首选）或仓库内文件。
-          # /data/ 在 .gitignore 里，CI checkout 拿不到 data/portfolio.json，
-          # 因此必须配 Gist —— 与 01-position-drawdown.yml 共用同一个变量，
-          # 两边本来读的就是同一份 portfolio.json。
-          # raw URL 本身是访问令牌，属敏感信息，放 secrets。
+          # 持仓来源。与 01 共用同一份 portfolio.json，raw URL 是访问令牌故放 secrets。
           POSITION_DRAWDOWN_GIST_URL: ${{ vars.POSITION_DRAWDOWN_GIST_URL || secrets.POSITION_DRAWDOWN_GIST_URL || '' }}
-          # 长桥通道开关。关掉后资讯、社区情绪、财报口径全部不跑 ——
-          # 港股将完全无外部信号。
+          # 关掉后港股将完全无外部信号。
           RISK_SCAN_WITH_NEWS: ${{ github.event.inputs.with_news && '1' || vars.RISK_SCAN_WITH_NEWS || '1' }}
-          # ── 长桥（港股资讯/社区情绪 + 全市场财报口径的唯一来源）──
-          # 接入点必须显式设为 cn，不能用 ${{ vars.LONGBRIDGE_REGION }}：
-          # SDK 自动判断（region=auto）在部分网络下会落回 .com 国际端点。
-          # 与 01-position-drawdown.yml 保持一致，官方文档：
-          # https://open.longbridge.com/zh-CN/docs/getting-started#api-host
+          # 长桥（港股资讯/社区情绪 + 全市场财报的唯一来源，同 01 的 3 件套）。
+          # REGION 硬编码 cn：region=auto 在部分网络会落回 .com 国际端点而连不上。
           LONGBRIDGE_REGION: 'cn'
-          # Legacy 3 件套（APP_KEY / APP_SECRET / ACCESS_TOKEN），与 01 相同。
-          # 缺任何一个，SDK 抛 "missing environment variable"，整个长桥通道空转。
+          # 缺任何一个都会让整条长桥通道空转。
           LONGBRIDGE_APP_KEY: ${{ secrets.LONGBRIDGE_APP_KEY }}
           LONGBRIDGE_APP_SECRET: ${{ secrets.LONGBRIDGE_APP_SECRET }}
           LONGBRIDGE_ACCESS_TOKEN: ${{ secrets.LONGBRIDGE_ACCESS_TOKEN }}
-          # ── LLM 兜底通道 ──
-          LLM_MINIMAX_API_KEY: ${{ secrets.LLM_MINIMAX_API_KEY }}
+          # LLM 兜底通道，整段与 00-daily-analysis.yml 对齐（含 LiteLLM YAML 档）。
+          # LLM_CHANNELS 是总闸：不在其中声明的 LLM_<NAME>_* 不会被 config.py 读取。
+          LITELLM_CONFIG: ${{ vars.LITELLM_CONFIG || secrets.LITELLM_CONFIG }}
+          LITELLM_CONFIG_YAML: ${{ vars.LITELLM_CONFIG_YAML || secrets.LITELLM_CONFIG_YAML }}
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          LITELLM_MODEL: ${{ vars.LITELLM_MODEL || secrets.LITELLM_MODEL }}
+          LITELLM_FALLBACK_MODELS: ${{ vars.LITELLM_FALLBACK_MODELS || secrets.LITELLM_FALLBACK_MODELS }}
+          AGENT_LITELLM_MODEL: ${{ vars.AGENT_LITELLM_MODEL || secrets.AGENT_LITELLM_MODEL }}
+          VISION_MODEL: ${{ vars.VISION_MODEL || secrets.VISION_MODEL }}
+          OPENAI_VISION_MODEL: ${{ vars.OPENAI_VISION_MODEL || secrets.OPENAI_VISION_MODEL }}
+          VISION_PROVIDER_PRIORITY: ${{ vars.VISION_PROVIDER_PRIORITY || secrets.VISION_PROVIDER_PRIORITY }}
+          LLM_TEMPERATURE: ${{ vars.LLM_TEMPERATURE || secrets.LLM_TEMPERATURE }}
+          LLM_USAGE_HMAC_SECRET: ${{ secrets.LLM_USAGE_HMAC_SECRET }}
+          LLM_USAGE_HMAC_KEY_VERSION: ${{ vars.LLM_USAGE_HMAC_KEY_VERSION || secrets.LLM_USAGE_HMAC_KEY_VERSION }}
+          LLM_PROMPT_CACHE_TELEMETRY_ENABLED: ${{ vars.LLM_PROMPT_CACHE_TELEMETRY_ENABLED || secrets.LLM_PROMPT_CACHE_TELEMETRY_ENABLED }}
+          LLM_PROMPT_CACHE_HINTS_ENABLED: ${{ vars.LLM_PROMPT_CACHE_HINTS_ENABLED || secrets.LLM_PROMPT_CACHE_HINTS_ENABLED }}
+          LLM_PROMPT_CACHE_DIAGNOSTICS_LEVEL: ${{ vars.LLM_PROMPT_CACHE_DIAGNOSTICS_LEVEL || secrets.LLM_PROMPT_CACHE_DIAGNOSTICS_LEVEL }}
+          LLM_CHANNELS: ${{ vars.LLM_CHANNELS || secrets.LLM_CHANNELS }}
+          LLM_HERMES_PROTOCOL: ${{ vars.LLM_HERMES_PROTOCOL || secrets.LLM_HERMES_PROTOCOL }}
+          LLM_HERMES_API_SURFACE: ${{ vars.LLM_HERMES_API_SURFACE || secrets.LLM_HERMES_API_SURFACE }}
+          LLM_HERMES_BASE_URL: ${{ vars.LLM_HERMES_BASE_URL || secrets.LLM_HERMES_BASE_URL }}
+          LLM_HERMES_API_KEY: ${{ secrets.LLM_HERMES_API_KEY }}
+          LLM_HERMES_MODELS: ${{ vars.LLM_HERMES_MODELS || secrets.LLM_HERMES_MODELS }}
+          LLM_HERMES_ENABLED: ${{ vars.LLM_HERMES_ENABLED || secrets.LLM_HERMES_ENABLED }}
+
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || secrets.GEMINI_MODEL || 'gemini-3-flash-preview' }}
+          GEMINI_MODEL_FALLBACK: ${{ vars.GEMINI_MODEL_FALLBACK || secrets.GEMINI_MODEL_FALLBACK || 'gemini-2.5-flash' }}
+          GEMINI_REQUEST_DELAY: '3.0'
+          
+          AIHUBMIX_KEY: ${{ secrets.AIHUBMIX_KEY }}
+
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEYS: ${{ secrets.OPENAI_API_KEYS }}
+          OPENAI_BASE_URL: ${{ vars.OPENAI_BASE_URL || secrets.OPENAI_BASE_URL }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || secrets.OPENAI_MODEL }}
+
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_API_KEYS: ${{ secrets.DEEPSEEK_API_KEYS }}
+          
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEYS: ${{ secrets.ANTHROPIC_API_KEYS }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || secrets.ANTHROPIC_MODEL || 'claude-3-5-sonnet-20241022' }}
+
+          # LLM 渠道模式（常见渠道名需显式映射，GitHub Actions 不会自动导入任意 Secret/Variable）
+          LLM_PRIMARY_PROTOCOL: ${{ vars.LLM_PRIMARY_PROTOCOL || secrets.LLM_PRIMARY_PROTOCOL }}
+          LLM_PRIMARY_API_SURFACE: ${{ vars.LLM_PRIMARY_API_SURFACE || secrets.LLM_PRIMARY_API_SURFACE }}
+          LLM_PRIMARY_BASE_URL: ${{ vars.LLM_PRIMARY_BASE_URL || secrets.LLM_PRIMARY_BASE_URL }}
+          LLM_PRIMARY_API_KEY: ${{ secrets.LLM_PRIMARY_API_KEY }}
+          LLM_PRIMARY_API_KEYS: ${{ secrets.LLM_PRIMARY_API_KEYS }}
+          LLM_PRIMARY_MODELS: ${{ vars.LLM_PRIMARY_MODELS || secrets.LLM_PRIMARY_MODELS }}
+          LLM_PRIMARY_ENABLED: ${{ vars.LLM_PRIMARY_ENABLED || secrets.LLM_PRIMARY_ENABLED }}
+          LLM_PRIMARY_EXTRA_HEADERS: ${{ vars.LLM_PRIMARY_EXTRA_HEADERS || secrets.LLM_PRIMARY_EXTRA_HEADERS }}
+
+          LLM_SECONDARY_PROTOCOL: ${{ vars.LLM_SECONDARY_PROTOCOL || secrets.LLM_SECONDARY_PROTOCOL }}
+          LLM_SECONDARY_API_SURFACE: ${{ vars.LLM_SECONDARY_API_SURFACE || secrets.LLM_SECONDARY_API_SURFACE }}
+          LLM_SECONDARY_BASE_URL: ${{ vars.LLM_SECONDARY_BASE_URL || secrets.LLM_SECONDARY_BASE_URL }}
+          LLM_SECONDARY_API_KEY: ${{ secrets.LLM_SECONDARY_API_KEY }}
+          LLM_SECONDARY_API_KEYS: ${{ secrets.LLM_SECONDARY_API_KEYS }}
+          LLM_SECONDARY_MODELS: ${{ vars.LLM_SECONDARY_MODELS || secrets.LLM_SECONDARY_MODELS }}
+          LLM_SECONDARY_ENABLED: ${{ vars.LLM_SECONDARY_ENABLED || secrets.LLM_SECONDARY_ENABLED }}
+          LLM_SECONDARY_EXTRA_HEADERS: ${{ vars.LLM_SECONDARY_EXTRA_HEADERS || secrets.LLM_SECONDARY_EXTRA_HEADERS }}
+
+          LLM_GEMINI_PROTOCOL: ${{ vars.LLM_GEMINI_PROTOCOL || secrets.LLM_GEMINI_PROTOCOL }}
+          LLM_GEMINI_API_SURFACE: ${{ vars.LLM_GEMINI_API_SURFACE || secrets.LLM_GEMINI_API_SURFACE }}
+          LLM_GEMINI_BASE_URL: ${{ vars.LLM_GEMINI_BASE_URL || secrets.LLM_GEMINI_BASE_URL }}
+          LLM_GEMINI_API_KEY: ${{ secrets.LLM_GEMINI_API_KEY }}
+          LLM_GEMINI_API_KEYS: ${{ secrets.LLM_GEMINI_API_KEYS }}
+          LLM_GEMINI_MODELS: ${{ vars.LLM_GEMINI_MODELS || secrets.LLM_GEMINI_MODELS }}
+          LLM_GEMINI_ENABLED: ${{ vars.LLM_GEMINI_ENABLED || secrets.LLM_GEMINI_ENABLED }}
+          LLM_GEMINI_EXTRA_HEADERS: ${{ vars.LLM_GEMINI_EXTRA_HEADERS || secrets.LLM_GEMINI_EXTRA_HEADERS }}
+
+          LLM_DEEPSEEK_PROTOCOL: ${{ vars.LLM_DEEPSEEK_PROTOCOL || secrets.LLM_DEEPSEEK_PROTOCOL }}
+          LLM_DEEPSEEK_API_SURFACE: ${{ vars.LLM_DEEPSEEK_API_SURFACE || secrets.LLM_DEEPSEEK_API_SURFACE }}
+          LLM_DEEPSEEK_BASE_URL: ${{ vars.LLM_DEEPSEEK_BASE_URL || secrets.LLM_DEEPSEEK_BASE_URL }}
+          LLM_DEEPSEEK_API_KEY: ${{ secrets.LLM_DEEPSEEK_API_KEY }}
+          LLM_DEEPSEEK_API_KEYS: ${{ secrets.LLM_DEEPSEEK_API_KEYS }}
+          LLM_DEEPSEEK_MODELS: ${{ vars.LLM_DEEPSEEK_MODELS || secrets.LLM_DEEPSEEK_MODELS }}
+          LLM_DEEPSEEK_ENABLED: ${{ vars.LLM_DEEPSEEK_ENABLED || secrets.LLM_DEEPSEEK_ENABLED }}
+          LLM_DEEPSEEK_EXTRA_HEADERS: ${{ vars.LLM_DEEPSEEK_EXTRA_HEADERS || secrets.LLM_DEEPSEEK_EXTRA_HEADERS }}
+
+          LLM_AIHUBMIX_PROTOCOL: ${{ vars.LLM_AIHUBMIX_PROTOCOL || secrets.LLM_AIHUBMIX_PROTOCOL }}
+          LLM_AIHUBMIX_API_SURFACE: ${{ vars.LLM_AIHUBMIX_API_SURFACE || secrets.LLM_AIHUBMIX_API_SURFACE }}
+          LLM_AIHUBMIX_BASE_URL: ${{ vars.LLM_AIHUBMIX_BASE_URL || secrets.LLM_AIHUBMIX_BASE_URL }}
+          LLM_AIHUBMIX_API_KEY: ${{ secrets.LLM_AIHUBMIX_API_KEY }}
+          LLM_AIHUBMIX_API_KEYS: ${{ secrets.LLM_AIHUBMIX_API_KEYS }}
+          LLM_AIHUBMIX_MODELS: ${{ vars.LLM_AIHUBMIX_MODELS || secrets.LLM_AIHUBMIX_MODELS }}
+          LLM_AIHUBMIX_ENABLED: ${{ vars.LLM_AIHUBMIX_ENABLED || secrets.LLM_AIHUBMIX_ENABLED }}
+          LLM_AIHUBMIX_EXTRA_HEADERS: ${{ vars.LLM_AIHUBMIX_EXTRA_HEADERS || secrets.LLM_AIHUBMIX_EXTRA_HEADERS }}
+
+          LLM_ANSPIRE_PROTOCOL: ${{ vars.LLM_ANSPIRE_PROTOCOL || secrets.LLM_ANSPIRE_PROTOCOL }}
+          LLM_ANSPIRE_API_SURFACE: ${{ vars.LLM_ANSPIRE_API_SURFACE || secrets.LLM_ANSPIRE_API_SURFACE }}
+          LLM_ANSPIRE_BASE_URL: ${{ vars.LLM_ANSPIRE_BASE_URL || secrets.LLM_ANSPIRE_BASE_URL }}
+          LLM_ANSPIRE_API_KEY: ${{ secrets.LLM_ANSPIRE_API_KEY }}
+          LLM_ANSPIRE_API_KEYS: ${{ secrets.LLM_ANSPIRE_API_KEYS }}
+          LLM_ANSPIRE_MODELS: ${{ vars.LLM_ANSPIRE_MODELS || secrets.LLM_ANSPIRE_MODELS }}
+          LLM_ANSPIRE_ENABLED: ${{ vars.LLM_ANSPIRE_ENABLED || secrets.LLM_ANSPIRE_ENABLED }}
+          LLM_ANSPIRE_EXTRA_HEADERS: ${{ vars.LLM_ANSPIRE_EXTRA_HEADERS || secrets.LLM_ANSPIRE_EXTRA_HEADERS }}
+
+          LLM_OPENAI_PROTOCOL: ${{ vars.LLM_OPENAI_PROTOCOL || secrets.LLM_OPENAI_PROTOCOL }}
+          LLM_OPENAI_API_SURFACE: ${{ vars.LLM_OPENAI_API_SURFACE || secrets.LLM_OPENAI_API_SURFACE }}
+          LLM_OPENAI_BASE_URL: ${{ vars.LLM_OPENAI_BASE_URL || secrets.LLM_OPENAI_BASE_URL }}
+          LLM_OPENAI_API_KEY: ${{ secrets.LLM_OPENAI_API_KEY }}
+          LLM_OPENAI_API_KEYS: ${{ secrets.LLM_OPENAI_API_KEYS }}
+          LLM_OPENAI_MODELS: ${{ vars.LLM_OPENAI_MODELS || secrets.LLM_OPENAI_MODELS }}
+          LLM_OPENAI_ENABLED: ${{ vars.LLM_OPENAI_ENABLED || secrets.LLM_OPENAI_ENABLED }}
+          LLM_OPENAI_EXTRA_HEADERS: ${{ vars.LLM_OPENAI_EXTRA_HEADERS || secrets.LLM_OPENAI_EXTRA_HEADERS }}
+
+          LLM_ANTHROPIC_PROTOCOL: ${{ vars.LLM_ANTHROPIC_PROTOCOL || secrets.LLM_ANTHROPIC_PROTOCOL }}
+          LLM_ANTHROPIC_API_SURFACE: ${{ vars.LLM_ANTHROPIC_API_SURFACE || secrets.LLM_ANTHROPIC_API_SURFACE }}
+          LLM_ANTHROPIC_BASE_URL: ${{ vars.LLM_ANTHROPIC_BASE_URL || secrets.LLM_ANTHROPIC_BASE_URL }}
+          LLM_ANTHROPIC_API_KEY: ${{ secrets.LLM_ANTHROPIC_API_KEY }}
+          LLM_ANTHROPIC_API_KEYS: ${{ secrets.LLM_ANTHROPIC_API_KEYS }}
+          LLM_ANTHROPIC_MODELS: ${{ vars.LLM_ANTHROPIC_MODELS || secrets.LLM_ANTHROPIC_MODELS }}
+          LLM_ANTHROPIC_ENABLED: ${{ vars.LLM_ANTHROPIC_ENABLED || secrets.LLM_ANTHROPIC_ENABLED }}
+          LLM_ANTHROPIC_EXTRA_HEADERS: ${{ vars.LLM_ANTHROPIC_EXTRA_HEADERS || secrets.LLM_ANTHROPIC_EXTRA_HEADERS }}
+
+          LLM_MOONSHOT_PROTOCOL: ${{ vars.LLM_MOONSHOT_PROTOCOL || secrets.LLM_MOONSHOT_PROTOCOL }}
+          LLM_MOONSHOT_API_SURFACE: ${{ vars.LLM_MOONSHOT_API_SURFACE || secrets.LLM_MOONSHOT_API_SURFACE }}
+          LLM_MOONSHOT_BASE_URL: ${{ vars.LLM_MOONSHOT_BASE_URL || secrets.LLM_MOONSHOT_BASE_URL }}
+          LLM_MOONSHOT_API_KEY: ${{ secrets.LLM_MOONSHOT_API_KEY }}
+          LLM_MOONSHOT_API_KEYS: ${{ secrets.LLM_MOONSHOT_API_KEYS }}
+          LLM_MOONSHOT_MODELS: ${{ vars.LLM_MOONSHOT_MODELS || secrets.LLM_MOONSHOT_MODELS }}
+          LLM_MOONSHOT_ENABLED: ${{ vars.LLM_MOONSHOT_ENABLED || secrets.LLM_MOONSHOT_ENABLED }}
+          LLM_MOONSHOT_EXTRA_HEADERS: ${{ vars.LLM_MOONSHOT_EXTRA_HEADERS || secrets.LLM_MOONSHOT_EXTRA_HEADERS }}
+
+          LLM_DASHSCOPE_PROTOCOL: ${{ vars.LLM_DASHSCOPE_PROTOCOL || secrets.LLM_DASHSCOPE_PROTOCOL }}
+          LLM_DASHSCOPE_API_SURFACE: ${{ vars.LLM_DASHSCOPE_API_SURFACE || secrets.LLM_DASHSCOPE_API_SURFACE }}
+          LLM_DASHSCOPE_BASE_URL: ${{ vars.LLM_DASHSCOPE_BASE_URL || secrets.LLM_DASHSCOPE_BASE_URL }}
+          LLM_DASHSCOPE_API_KEY: ${{ secrets.LLM_DASHSCOPE_API_KEY }}
+          LLM_DASHSCOPE_API_KEYS: ${{ secrets.LLM_DASHSCOPE_API_KEYS }}
+          LLM_DASHSCOPE_MODELS: ${{ vars.LLM_DASHSCOPE_MODELS || secrets.LLM_DASHSCOPE_MODELS }}
+          LLM_DASHSCOPE_ENABLED: ${{ vars.LLM_DASHSCOPE_ENABLED || secrets.LLM_DASHSCOPE_ENABLED }}
+          LLM_DASHSCOPE_EXTRA_HEADERS: ${{ vars.LLM_DASHSCOPE_EXTRA_HEADERS || secrets.LLM_DASHSCOPE_EXTRA_HEADERS }}
+
+          LLM_ZHIPU_PROTOCOL: ${{ vars.LLM_ZHIPU_PROTOCOL || secrets.LLM_ZHIPU_PROTOCOL }}
+          LLM_ZHIPU_API_SURFACE: ${{ vars.LLM_ZHIPU_API_SURFACE || secrets.LLM_ZHIPU_API_SURFACE }}
+          LLM_ZHIPU_BASE_URL: ${{ vars.LLM_ZHIPU_BASE_URL || secrets.LLM_ZHIPU_BASE_URL }}
+          LLM_ZHIPU_API_KEY: ${{ secrets.LLM_ZHIPU_API_KEY }}
+          LLM_ZHIPU_API_KEYS: ${{ secrets.LLM_ZHIPU_API_KEYS }}
+          LLM_ZHIPU_MODELS: ${{ vars.LLM_ZHIPU_MODELS || secrets.LLM_ZHIPU_MODELS }}
+          LLM_ZHIPU_ENABLED: ${{ vars.LLM_ZHIPU_ENABLED || secrets.LLM_ZHIPU_ENABLED }}
+          LLM_ZHIPU_EXTRA_HEADERS: ${{ vars.LLM_ZHIPU_EXTRA_HEADERS || secrets.LLM_ZHIPU_EXTRA_HEADERS }}
+
+          LLM_MINIMAX_PROTOCOL: ${{ vars.LLM_MINIMAX_PROTOCOL || secrets.LLM_MINIMAX_PROTOCOL }}
+          LLM_MINIMAX_API_SURFACE: ${{ vars.LLM_MINIMAX_API_SURFACE || secrets.LLM_MINIMAX_API_SURFACE }}
           LLM_MINIMAX_BASE_URL: ${{ vars.LLM_MINIMAX_BASE_URL || secrets.LLM_MINIMAX_BASE_URL }}
+          LLM_MINIMAX_API_KEY: ${{ secrets.LLM_MINIMAX_API_KEY }}
+          LLM_MINIMAX_API_KEYS: ${{ secrets.LLM_MINIMAX_API_KEYS }}
           LLM_MINIMAX_MODELS: ${{ vars.LLM_MINIMAX_MODELS || secrets.LLM_MINIMAX_MODELS }}
-          LLM_MINIMAX_PROTOCOL: ${{ vars.LLM_MINIMAX_PROTOCOL || 'anthropic' }}
+          LLM_MINIMAX_ENABLED: ${{ vars.LLM_MINIMAX_ENABLED || secrets.LLM_MINIMAX_ENABLED }}
+          LLM_MINIMAX_EXTRA_HEADERS: ${{ vars.LLM_MINIMAX_EXTRA_HEADERS || secrets.LLM_MINIMAX_EXTRA_HEADERS }}
+
+          LLM_VOLCENGINE_PROTOCOL: ${{ vars.LLM_VOLCENGINE_PROTOCOL || secrets.LLM_VOLCENGINE_PROTOCOL }}
+          LLM_VOLCENGINE_API_SURFACE: ${{ vars.LLM_VOLCENGINE_API_SURFACE || secrets.LLM_VOLCENGINE_API_SURFACE }}
+          LLM_VOLCENGINE_BASE_URL: ${{ vars.LLM_VOLCENGINE_BASE_URL || secrets.LLM_VOLCENGINE_BASE_URL }}
+          LLM_VOLCENGINE_API_KEY: ${{ secrets.LLM_VOLCENGINE_API_KEY }}
+          LLM_VOLCENGINE_API_KEYS: ${{ secrets.LLM_VOLCENGINE_API_KEYS }}
+          LLM_VOLCENGINE_MODELS: ${{ vars.LLM_VOLCENGINE_MODELS || secrets.LLM_VOLCENGINE_MODELS }}
+          LLM_VOLCENGINE_ENABLED: ${{ vars.LLM_VOLCENGINE_ENABLED || secrets.LLM_VOLCENGINE_ENABLED }}
+          LLM_VOLCENGINE_EXTRA_HEADERS: ${{ vars.LLM_VOLCENGINE_EXTRA_HEADERS || secrets.LLM_VOLCENGINE_EXTRA_HEADERS }}
+
+          LLM_SILICONFLOW_PROTOCOL: ${{ vars.LLM_SILICONFLOW_PROTOCOL || secrets.LLM_SILICONFLOW_PROTOCOL }}
+          LLM_SILICONFLOW_API_SURFACE: ${{ vars.LLM_SILICONFLOW_API_SURFACE || secrets.LLM_SILICONFLOW_API_SURFACE }}
+          LLM_SILICONFLOW_BASE_URL: ${{ vars.LLM_SILICONFLOW_BASE_URL || secrets.LLM_SILICONFLOW_BASE_URL }}
+          LLM_SILICONFLOW_API_KEY: ${{ secrets.LLM_SILICONFLOW_API_KEY }}
+          LLM_SILICONFLOW_API_KEYS: ${{ secrets.LLM_SILICONFLOW_API_KEYS }}
+          LLM_SILICONFLOW_MODELS: ${{ vars.LLM_SILICONFLOW_MODELS || secrets.LLM_SILICONFLOW_MODELS }}
+          LLM_SILICONFLOW_ENABLED: ${{ vars.LLM_SILICONFLOW_ENABLED || secrets.LLM_SILICONFLOW_ENABLED }}
+          LLM_SILICONFLOW_EXTRA_HEADERS: ${{ vars.LLM_SILICONFLOW_EXTRA_HEADERS || secrets.LLM_SILICONFLOW_EXTRA_HEADERS }}
+
+          LLM_OPENROUTER_PROTOCOL: ${{ vars.LLM_OPENROUTER_PROTOCOL || secrets.LLM_OPENROUTER_PROTOCOL }}
+          LLM_OPENROUTER_API_SURFACE: ${{ vars.LLM_OPENROUTER_API_SURFACE || secrets.LLM_OPENROUTER_API_SURFACE }}
+          LLM_OPENROUTER_BASE_URL: ${{ vars.LLM_OPENROUTER_BASE_URL || secrets.LLM_OPENROUTER_BASE_URL }}
+          LLM_OPENROUTER_API_KEY: ${{ secrets.LLM_OPENROUTER_API_KEY }}
+          LLM_OPENROUTER_API_KEYS: ${{ secrets.LLM_OPENROUTER_API_KEYS }}
+          LLM_OPENROUTER_MODELS: ${{ vars.LLM_OPENROUTER_MODELS || secrets.LLM_OPENROUTER_MODELS }}
+          LLM_OPENROUTER_ENABLED: ${{ vars.LLM_OPENROUTER_ENABLED || secrets.LLM_OPENROUTER_ENABLED }}
+          LLM_OPENROUTER_EXTRA_HEADERS: ${{ vars.LLM_OPENROUTER_EXTRA_HEADERS || secrets.LLM_OPENROUTER_EXTRA_HEADERS }}
+
+          LLM_OLLAMA_PROTOCOL: ${{ vars.LLM_OLLAMA_PROTOCOL || secrets.LLM_OLLAMA_PROTOCOL }}
+          LLM_OLLAMA_API_SURFACE: ${{ vars.LLM_OLLAMA_API_SURFACE || secrets.LLM_OLLAMA_API_SURFACE }}
+          LLM_OLLAMA_BASE_URL: ${{ vars.LLM_OLLAMA_BASE_URL || secrets.LLM_OLLAMA_BASE_URL }}
+          LLM_OLLAMA_API_KEY: ${{ secrets.LLM_OLLAMA_API_KEY }}
+          LLM_OLLAMA_API_KEYS: ${{ secrets.LLM_OLLAMA_API_KEYS }}
+          LLM_OLLAMA_MODELS: ${{ vars.LLM_OLLAMA_MODELS || secrets.LLM_OLLAMA_MODELS }}
+          LLM_OLLAMA_ENABLED: ${{ vars.LLM_OLLAMA_ENABLED || secrets.LLM_OLLAMA_ENABLED }}
+          LLM_OLLAMA_EXTRA_HEADERS: ${{ vars.LLM_OLLAMA_EXTRA_HEADERS || secrets.LLM_OLLAMA_EXTRA_HEADERS }}
 
         run: |
-          # ── 1) 决定持仓文件来源：Gist 优先，回退仓库内路径 ──
-          # /data/ 在 .gitignore 第 57 行被排除，CI checkout 拿不到
-          # data/portfolio.json —— 没有 Gist 的话本 workflow 会每天静默空转。
-          # 与 01-position-drawdown.yml 共用同一个 secret（读的是同一份文件）。
+          # 1) 持仓文件来源。/data/ 在 .gitignore 里，CI checkout 拿不到，
+          #    没有 Gist 就会每天静默空转。
           if [ -n "$POSITION_DRAWDOWN_GIST_URL" ]; then
             HTTP_STATUS=$(curl -s -o /tmp/portfolio.json -w "%{http_code}" "$POSITION_DRAWDOWN_GIST_URL")
             if [ "$HTTP_STATUS" != "200" ]; then
@@ -226,7 +377,7 @@ jobs:
             exit 0
           fi
 
-          # ── 2) 未配置任何通知渠道 → dry-run ──
+          # 2) 未配通知渠道则 dry-run
           if [ -z "$FEISHU_WEBHOOK_URL" ] && [ -z "$FEISHU_APP_ID" ] \
              && [ -z "$WECHAT_WEBHOOK_URL" ] \
              && [ -z "$DINGTALK_WEBHOOK_URL" ] \
@@ -267,8 +418,7 @@ jobs:
             2>&1 | tee logs/risk-scan-run.log
           echo "::notice::排雷耗时 ${SECONDS}s"
 
-      # 只在 CLI 退出码 0 时落盘。推送失败时 cli 会返回 3 且不写状态文件，
-      # 这里也不会存 —— 避免"这次没推成功却被标记为已告知"导致告警被吞。
+      # 只在退出码 0 时落盘：推送失败（cli 返回 3）时不存，避免告警被吞。
       - name: 写入本次状态
         if: success()
         uses: actions/cache/save@v4
@@ -285,9 +435,7 @@ jobs:
             reports/risk-scan/
             logs/risk-scan-run.log
           retention-days: 90
-          # 脚本崩了 / 持仓文件缺 / 数据源全挂时目录可能空着。
-          # 默认 v6 会把"0 文件"判成 error 让 job 翻红，但真正的失败原因
-          # 已经在前一步 exit 了，这里静默成功，别污染 job 状态。
+          # 目录空时 v6 默认判 error 翻红，但真失败已在前一步 exit，别污染 job 状态。
           if-no-files-found: ignore
 
       - name: 显示今日报告
@@ -295,7 +443,7 @@ jobs:
         run: |
           echo ""
           echo "=========================================="
-          echo "🛡️ 持仓排雷 · ${{ github.run_number }}"
+          echo "持仓排雷 · ${{ github.run_number }}"
           echo "=========================================="
           if [ -d "reports/risk-scan" ] && [ "$(ls -A reports/risk-scan 2>/dev/null)" ]; then
             LATEST=$(ls -t reports/risk-scan/*.md 2>/dev/null | head -1)

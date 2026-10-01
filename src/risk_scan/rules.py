@@ -96,7 +96,6 @@ class EventClass(str, Enum):
     REGULATORY = "regulatory"    # 监管风险，进风险阶梯
     SHAREHOLDER = "shareholder"  # 减持/质押/解禁，不进阶梯
     CORPORATE = "corporate"      # 担保/增发/收购，不进阶梯
-    POSITIVE = "positive"        # 利好，不进阶梯，单列一段
     FUNDAMENTAL = "fundamental"  # 财务异常（连续亏损），确定性数据，进阶梯
 
 
@@ -116,13 +115,6 @@ BROAD_SCAN_KEYWORDS: tuple[str, ...] = (
     "亏损", "暴雷", "停产", "违约", "召回", "破产", "重整", "接管",
     "减持", "解禁", "做空", "造假", "贪腐", "被查", "失联", "留置",
 )
-
-#: 利好规则表 —— 独立于风险阶梯，命中后进报告的「利好」段。
-#: 定义在 :data:`FILING_RULES` 之后（需要 :class:`RiskRule` 已就绪）。
-#:
-#: 为什么要有它：一个只报风险的报告会训练你忽略它。知道持仓里哪只
-#: 刚拿到大单、哪只完成回购，本身是有用的信息，也能帮你判断"公司主动
-#: 披露"与"被动出事"的对比。
 
 #: 风险信号的热度阈值。同一只票在窗口内命中风险词的公告条数超过它，
 #: 说明市场关注度异常抬升 —— 这是一条**任何单条公告里都看不到**的信息。
@@ -291,40 +283,6 @@ KEYWORD_RULES: tuple[RiskRule, ...] = (
 # 交易所公告规则表：仅 EXCHANGE_FILING 通道使用，可定级到致命档。
 FILING_RULES: tuple[RiskRule, ...] = KEYWORD_RULES
 
-# 利好规则表：确定性命中即定级，不走 LLM。
-POSITIVE_RULES: tuple[RiskRule, ...] = (
-    RiskRule(
-        "回购", RiskLevel.WARNING, "利好", AGGRAVATING, 90,
-        "股份回购", event_class=EventClass.POSITIVE,
-    ),
-    RiskRule(
-        "增持", RiskLevel.WATCH, "利好", AGGRAVATING, 90,
-        "股东增持", event_class=EventClass.POSITIVE,
-    ),
-    RiskRule(
-        "股权激励", RiskLevel.WATCH, "利好", AGGRAVATING, 365,
-        "股权激励计划", event_class=EventClass.POSITIVE,
-    ),
-    RiskRule(
-        "中标", RiskLevel.WATCH, "利好", AGGRAVATING, 90,
-        "中标/签署重大合同", event_class=EventClass.POSITIVE,
-    ),
-    RiskRule(
-        "业绩预增", RiskLevel.WARNING, "利好", AGGRAVATING, 180,
-        "业绩预增（明确向好）", event_class=EventClass.POSITIVE,
-    ),
-    # 刻意**不收**「业绩预告」：它方向中性，预告内容可能是预亏。
-    # 判断方向需要读正文，属于 LLM 的活，不该由关键词表武断下结论。
-    RiskRule(
-        "重组", RiskLevel.WATCH, "利好", AGGRAVATING, 365,
-        "重大资产重组", event_class=EventClass.POSITIVE,
-    ),
-    RiskRule(
-        "获批", RiskLevel.WATCH, "利好", AGGRAVATING, 180,
-        "取得监管批准", event_class=EventClass.POSITIVE,
-    ),
-)
-
 # 舆情新闻规则表：仅 NEWS 通道使用。
 #
 # 只收录"硬监管事件"这类即使一句话也能确定性质的词。理由有两条：
@@ -458,13 +416,11 @@ ALL_RULES: tuple[RiskRule, ...] = FILING_RULES + NEWS_RULES
 def rules_for(source_type: SourceType) -> tuple[RiskRule, ...]:
     """取某个信息源对应的规则表。
 
-    利好规则对两种来源都生效：公告里的回购公告要认，舆情里捞到的回购消息
-    同样要认 —— 否则港股（没有公告通道）会完全看不到利好。
     财务异常只认交易所口径（长桥 corp_action），不用于舆情。
     """
     if source_type is SourceType.NEWS:
-        return NEWS_RULES + POSITIVE_RULES
-    return FILING_RULES + POSITIVE_RULES + FINANCIAL_RULES
+        return NEWS_RULES
+    return FILING_RULES + FINANCIAL_RULES
 
 
 def needs_broad_scan(title: str) -> bool:

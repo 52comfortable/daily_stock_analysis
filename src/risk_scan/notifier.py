@@ -178,9 +178,8 @@ def build_markdown(
     actionable = report.actionable(push_min_level)
     new_codes = set(new_map or {})
     lines: List[str] = [
-        f"**{title}** · {report.as_of}",
-        "",
-        f"扫描窗口 {report.window_start} ~ {report.window_end}　"
+        f"**{title}** · {report.as_of}　"
+        f"窗口 {report.window_start}~{report.window_end}　"
         f"持仓 {report.total_positions} 只（覆盖 {report.covered_count}，"
         f"未覆盖 {len(report.uncovered)}）",
         "",
@@ -207,13 +206,11 @@ def build_markdown(
                 f"**{verdict.level.label}**" + ("　[ST]" if verdict.is_st else "")
             )
             if verdict.categories:
-                lines.append("    分类结算：")
                 for cat in verdict.categories:
                     is_primary = (
                         verdict.top_event is not None
                         and cat.top_event is verdict.top_event
                     )
-                    mark = "◀" if is_primary else "　"
                     date = cat.top_event.publish_date if cat.top_event else "—"
                     kw = cat.top_event.rule.keyword if cat.top_event else "—"
                     link = (
@@ -222,13 +219,13 @@ def build_markdown(
                         else ""
                     )
                     extra = f"　（{'；'.join(cat.reasons)}）" if cat.reasons else ""
-                    tail = "　← 主因" if is_primary else ""
+                    tail = "　**← 主因**" if is_primary else ""
                     lines.append(
-                        f"      {mark} {cat.category}：{cat.level.label}"
-                        f"　`{kw}` {date}{link}{extra}{tail}"
+                        f"- {'◀ ' if is_primary else ''}**{cat.category}**"
+                        f"（{cat.level.label}）　`{kw}` {date}{link}{extra}{tail}"
                     )
             if verdict.downgrade_reason:
-                lines.append(f"    ⤷ {verdict.downgrade_reason}")
+                lines.append(f"- ⤷ {verdict.downgrade_reason}")
     else:
         clean = [v for v in report.sorted_verdicts() if v.level == RiskLevel.CLEAR]
         lines.append(
@@ -273,32 +270,9 @@ def build_markdown(
             seen_fin.add(key)
             lines.append(f"- {event.title}")
 
-    # ── 其它段：利好 / 股东行为 / 公司运作 ──
-    positives = [
-        (v, e) for v in report.sorted_verdicts() for e in v.positive_events
-    ]
-    if positives:
-        lines.append("")
-        lines.append("✨ **利好动向**（不参与风险定级）")
-        # 同一只票同一类利好只报最新一条 —— 回购进展公告会按月发好几期，
-        # 全部列出来没有信息量。
-        latest: Dict[Any, Any] = {}
-        for verdict, event in positives:
-            key = (verdict.code, event.rule.keyword)
-            current = latest.get(key)
-            if current is None or event.publish_date > current[1].publish_date:
-                latest[key] = (verdict, event)
-        for (code, keyword), (verdict, event) in sorted(
-            latest.items(), key=lambda kv: kv[1][1].publish_date, reverse=True
-        ):
-            lines.append(
-                f"- {verdict.name} ({code})　`{keyword}` {_fmt_date(event)}"
-            )
-
-    others = [
+    others = list(
         (v, e) for v in report.sorted_verdicts() for e in v.other_events
-        if e.event_class is not EventClass.POSITIVE
-    ]
+    )
     if others:
         lines.append("")
         lines.append("📋 **其它动向**（股东行为 / 公司运作）")

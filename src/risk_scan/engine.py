@@ -103,15 +103,11 @@ class RiskVerdict:
     is_st: bool = False
     announcement_count: int = 0
     error: str = ""
-    #: 不参与定级的其它动向（股东行为 / 公司运作 / 利好），报告里单独成段
+    #: 不参与定级的其它动向（股东行为 / 公司运作），报告里单独成段
     other_events: List[RiskEvent] = field(default_factory=list)
     #: 窗口内风险类公告条数；超过阈值视为关注度异常
     heat: int = 0
     is_hot: bool = False
-
-    @property
-    def positive_events(self) -> List[RiskEvent]:
-        return [e for e in self.other_events if e.event_class is EventClass.POSITIVE]
 
     @property
     def mitigation_events(self) -> List[RiskEvent]:
@@ -712,7 +708,7 @@ def evaluate_stock(
     # 进风险阶梯的是「监管」与「财务异常」两类：
     #   监管  —— 来自公告或舆情
     #   财务  —— 来自长桥 corp_action 的财报口径（确定性数据，不受舆情封顶）
-    # 其余（股东行为 / 公司运作 / 利好）单独收集，报告里另起段落。
+    # 其余（股东行为 / 公司运作）单独收集，报告里另起段落。
     # 财务事件**不能**进 other_events —— 它已经进了阶梯，两边都放会重复。
     in_ladder = (EventClass.REGULATORY, EventClass.FUNDAMENTAL)
     events = [e for e in all_events if e.event_class in in_ladder]
@@ -756,13 +752,7 @@ def evaluate_stock(
     verdict.level = worst.level
     verdict.top_event = worst.top_event
 
-    reasons: List[str] = []
-    if len(categories) > 1:
-        others = "、".join(
-            f"{c.category}{c.level.label}" for c in categories if c is not worst
-        )
-        reasons.append(f"其他类别：{others}")
-    reasons.extend(worst.reasons)
+    reasons: List[str] = list(worst.reasons)
 
     # 确定性封顶：按主因事件的信息源性质硬性截断。
     # 放在最后一步执行，因此无论前面结算出多高都拦得住。

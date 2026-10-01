@@ -284,13 +284,16 @@ def _severity_to_level(severity: str) -> RiskLevel:
     }.get((severity or "").strip().lower(), RiskLevel.WARNING)
 
 
-def _resolve_llm_endpoint(config: Any) -> Optional[Tuple[str, str, str]]:
-    """解析 LLM 端点，返回 ``(model, api_key, api_base)``。
+def _resolve_llm_endpoint(config: Any) -> Optional[Dict[str, Any]]:
+    """解析 LLM 端点，返回 ``{"model", "api_key", "api_base", "extra_headers"}``。
 
-    必须走 ``config.llm_channels`` 而不是 ``config.litellm_model``：后者是
-    legacy env 兜底，模型名可能形如 ``openai/MiniMax-M3`` 却**不带** base_url 和
-    api_key，直接用会打到 OpenAI 官方端点并报 "Missing credentials"。
-    真实凭证在通道配置里。
+    通道档优先；取不到再走 legacy 档（``OPENAI_API_KEY`` 三件套）。必须两条
+    都支持：``config.llm_channels`` 只在 ``LLM_CHANNELS`` 列了通道名时才被
+    填充，只配 legacy 三件套的用户会被误判成"没配 LLM"。
+
+    legacy 档复用 ``config.litellm_model`` + ``config.extra_litellm_params()``：
+    前者已补好 ``openai/`` 前缀，后者会按 base_url 自动补 aihubmix 的
+    ``APP-Code`` 头 —— 自己重写一遍就会漏。
     """
     for channel in list(getattr(config, "llm_channels", None) or []):
         if not isinstance(channel, dict) or not channel.get("enabled", True):
@@ -311,8 +314,35 @@ def _resolve_llm_endpoint(config: Any) -> Optional[Tuple[str, str, str]]:
         if not api_key and not base:
             # 既无 key 也无 base：多半是本地 ollama 之类，但它仍需要 base
             continue
-        return str(models[0]).strip(), api_key, base
-    return None
+        return {
+            "model": str(models[0]).strip(),
+            "api_key": api_key,
+            "api_base": base,
+            "extra_headers": None,
+        }
+
+    # ── legacy 档兜底 ──
+    model = str(getattr(config, "litellm_model", "") or "").strip()
+    if not model:
+        return None
+    # import 放在空值判断之后：通道档与"什么都没配"都不碰 src.config 的重依赖链
+    from src.config import extra_litellm_params
+
+    params = extra_litellm_params(model, config)
+    keys = [
+        str(k).strip()
+        for k in (getattr(config, "openai_api_keys", None) or [])
+        if str(k).strip()
+    ]
+    if not keys:
+        single = str(getattr(config, "openai_api_key", None) or "").strip()
+        keys = [single] if single else []
+    return {
+        "model": model,
+        "api_key": keys[0] if keys else "",
+        "api_base": str(params.get("api_base") or "").strip(),
+        "extra_headers": params.get("extra_headers"),
+    }
 
 
 def _llm_json(messages: List[Dict[str, str]], *, timeout: int = 90,
@@ -332,7 +362,7 @@ def _llm_json(messages: List[Dict[str, str]], *, timeout: int = 90,
         if endpoint is None:
             logger.info("未配置可用的 LLM 通道，跳过兜底判定")
             return None
-        model, api_key, base = endpoint
+        model = endpoint["model"]
         kwargs: Dict[str, Any] = {
             "model": model,
             "messages": messages,
@@ -341,10 +371,12 @@ def _llm_json(messages: List[Dict[str, str]], *, timeout: int = 90,
             "max_tokens": int(max_tokens),
             "response_format": {"type": "json_object"},
         }
-        if api_key:
-            kwargs["api_key"] = api_key
-        if base:
-            kwargs["api_base"] = base
+        if endpoint.get("api_key"):
+            kwargs["api_key"] = endpoint["api_key"]
+        if endpoint.get("api_base"):
+            kwargs["api_base"] = endpoint["api_base"]
+        if endpoint.get("extra_headers"):
+            kwargs["extra_headers"] = endpoint["extra_headers"]
         kwargs = apply_litellm_generation_params(
             kwargs, model=model, temperature=0.0
         )

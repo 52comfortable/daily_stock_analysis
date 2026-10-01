@@ -519,39 +519,38 @@ class AkshareFundamentalAdapter:
             "errors": [],
         }
 
+        from .akshare_fetcher import _to_sina_tx_symbol
+
+        market = _to_sina_tx_symbol(stock_code)[:2]
+        stock_code = _normalize_code(stock_code)
         stock_df, stock_source, stock_errors = self._call_df_candidates([
-            ("stock_individual_fund_flow", {"stock": stock_code}),
-            ("stock_individual_fund_flow", {"symbol": stock_code}),
-            ("stock_individual_fund_flow", {}),
-            ("stock_main_fund_flow", {"symbol": stock_code}),
-            ("stock_main_fund_flow", {}),
+            ("stock_individual_fund_flow", {"stock": stock_code, "market": market}),
         ])
         result["errors"].extend(stock_errors)
-        if stock_df is not None:
-            row = _extract_latest_row(stock_df, stock_code)
-            if row is not None:
-                net_inflow = _safe_float(_pick_by_keywords(row, ["主力净流入", "净流入", "净额"]))
-                inflow_5d = _safe_float(_pick_by_keywords(row, ["5日", "五日"]))
-                inflow_10d = _safe_float(_pick_by_keywords(row, ["10日", "十日"]))
-                result["stock_flow"] = {
-                    "main_net_inflow": net_inflow,
-                    "inflow_5d": inflow_5d,
-                    "inflow_10d": inflow_10d,
-                }
-                result["source_chain"].append(f"capital_stock:{stock_source}")
+        if stock_df is not None and "日期" in stock_df:
+            dates = pd.to_datetime(stock_df["日期"], errors="coerce")
+            if dates.notna().any():
+                row = stock_df.loc[dates.idxmax()]
+                net_inflow = _safe_float(row.get("主力净流入-净额"))
+                if net_inflow is not None and math.isfinite(net_inflow):
+                    result["stock_flow"] = {
+                        "main_net_inflow": net_inflow,
+                        "inflow_5d": None,
+                        "inflow_10d": None,
+                    }
+                    result["source_chain"].append(f"capital_stock:{stock_source}")
 
         sector_df, sector_source, sector_errors = self._call_df_candidates([
             ("stock_sector_fund_flow_rank", {}),
-            ("stock_sector_fund_flow_summary", {}),
         ])
         result["errors"].extend(sector_errors)
         if sector_df is not None:
             name_col = next((c for c in sector_df.columns if any(k in str(c) for k in ("板块", "行业", "名称", "name"))), None)
-            flow_col = next((c for c in sector_df.columns if any(k in str(c) for k in ("净流入", "主力", "flow", "净额"))), None)
+            flow_col = "今日主力净流入-净额" if "今日主力净流入-净额" in sector_df else None
             if name_col and flow_col:
                 work_df = sector_df[[name_col, flow_col]].copy()
                 work_df[flow_col] = pd.to_numeric(work_df[flow_col], errors="coerce")
-                work_df = work_df.dropna(subset=[flow_col])
+                work_df = work_df.loc[work_df[flow_col].between(-math.inf, math.inf, inclusive="neither")]
                 top_df = work_df.nlargest(top_n, flow_col)
                 bottom_df = work_df.nsmallest(top_n, flow_col)
                 result["sector_rankings"] = {

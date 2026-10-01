@@ -1,4 +1,4 @@
-"""公告抓取层（巨潮资讯）。
+﻿"""公告抓取层（巨潮资讯）。
 
 按持仓逐只拉取全量公告，而不是旧版脚本那样按关键词全市场扫。
 持仓只有十几只时，逐只查询的优势很实在：
@@ -15,11 +15,13 @@
 from __future__ import annotations
 
 import logging
+import os
 import re
 import time
 from dataclasses import dataclass
 from datetime import date, timedelta
-from typing import Any, Dict, Iterable, List, Optional
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .rules import SourceType
 
@@ -118,13 +120,22 @@ def _to_iso(value: Any) -> str:
 
 def _fetch_one_via_akshare(
     code: str, start_compact: str, end_compact: str
-) -> List[Announcement]:
-    """用 akshare 拉单只股票的全部公告。"""
+) -> Optional[List[Announcement]]:
+    """用 akshare 拉单只股票的全部公告。
+
+    **失败返回 None，成功但无数据返回 []**。两者必须区分：
+
+    * ``[]``  → 这家公司窗口内确实没发公告
+    * ``None`` → 抓取失败（网络/限流/代码错误）
+
+    混为一谈会让一次网络抖动被报成「⚪ 无风险」，这是排雷最危险的
+    失败模式 —— 用户看到的是"没事"，实际是"没查到"。
+    """
     try:
         import akshare as ak
     except Exception as exc:  # noqa: BLE001
         logger.error("akshare 不可用: %s", exc)
-        return []
+        return None
 
     try:
         df = ak.stock_zh_a_disclosure_report_cninfo(
@@ -136,7 +147,7 @@ def _fetch_one_via_akshare(
         )
     except Exception as exc:  # noqa: BLE001
         logger.warning("巨潮抓取失败 %s: %s", code, exc)
-        return []
+        return None
 
     if df is None or getattr(df, "empty", True):
         return []
@@ -192,10 +203,12 @@ def _crosscheck_via_raw(
 def fetch_announcements(
     codes: Iterable[str],
     *,
+    names: Optional[Dict[str, str]] = None,
     start: date,
     end: date,
     delay: float = 0.35,
     crosscheck: bool = True,
+    ah_map: Optional[Dict[str, str]] = None,
 ) -> Dict[str, List[Announcement]]:
     """逐只抓取公告，返回 ``{code: [Announcement, ...]}``。
 
@@ -215,17 +228,55 @@ def fetch_announcements(
     start_dash = start.isoformat()
     end_dash = end.isoformat()
 
-    target = [str(c).strip() for c in codes if str(c or "").strip()]
-    if not target:
+    if not any(str(c or "").strip() for c in codes):
         return {}
 
     session: Optional[CninfoSession] = None
-    results: Dict[str, List[Announcement]] = {}
+    results: Dict[str, Optional[List[Announcement]]] = {}
     empty_codes: List[str] = []
-    names: Dict[str, str] = {}
+    found_names: Dict[str, str] = {}
+    skipped: List[str] = []
+    failed: List[str] = []
+    # 优先用调用方给的（来自缓存的）映射；没给才现算。
+    if ah_map is None:
+        ah_map = build_ah_map(names)
+
+    # 展开成"实际去查巨潮的代码"，并记住它属于哪只持仓
+    target: List[str] = []
+    owner: Dict[str, str] = {}      # 巨潮代码 -> 持仓原始代码
+    for raw in codes:
+        text = str(raw or "").strip()
+        if not text:
+            continue
+        bare = text.split(".")[0] if "." in text else text
+        if _is_cn_filing_code(text):
+            target.append(text)
+            owner[text] = text
+            continue
+        a_share = ah_map.get(bare.zfill(5))
+        if a_share:
+            # A+H：用 A 线代码去查巨潮，公告归回原持仓
+            target.append(a_share)
+            owner[a_share] = text
+            logger.info(
+                "A+H 映射：%s 改查 A 线 %s 取公告", text, a_share
+            )
+        else:
+            # 港股/美股且非 A+H。巨潮只收 A 股，强行传进去必然 KeyError，
+            # 白等一轮还在日志里刷 WARNING。直接跳过，由舆情通道覆盖。
+            skipped.append(text)
 
     for code in target:
         rows = _fetch_one_via_akshare(code, start_compact, end_compact)
+        held = owner.get(code, code)
+        if rows is None:
+            # 抓取失败：置 None 而不是空列表，让 evaluate_holdings 标成
+            # 「未获取到公告数据」而不是「无风险」
+            results[held] = None
+            failed.append(held)
+            if delay:
+                time.sleep(delay)
+            continue
         # 去重：同一只票同一天可能有多条公告，主键用 (日期, 标题)
         seen = set()
         unique: List[Announcement] = []
@@ -236,13 +287,23 @@ def fetch_announcements(
             seen.add(key)
             unique.append(item)
         unique.sort(key=lambda a: a.publish_date, reverse=True)
-        results[code] = unique
+        # 归回持仓原始代码：A+H 的 A 线公告要挂回港股代码上
+        results[held] = [Announcement(
+            code=held, name=a.name, title=a.title, publish_date=a.publish_date,
+            url=a.url, source=a.source, source_type=a.source_type,
+        ) for a in unique]
         if unique:
-            names[code] = unique[0].name
+            found_names[held] = unique[0].name
         else:
-            empty_codes.append(code)
+            empty_codes.append(held)
         if delay:
             time.sleep(delay)
+
+    if skipped:
+        logger.debug(
+            "巨潮通道跳过 %d 个非 A 股代码（由舆情通道覆盖）: %s",
+            len(skipped), "、".join(skipped),
+        )
 
     if crosscheck and empty_codes:
         try:
@@ -253,11 +314,245 @@ def fetch_announcements(
         if session is not None:
             for code in empty_codes:
                 _crosscheck_via_raw(
-                    session, code, names.get(code, code), start_dash, end_dash
+                    session, code, found_names.get(code, code), start_dash, end_dash
                 )
                 time.sleep(delay)
 
     return results
+
+
+def _is_cn_filing_code(code: str) -> bool:
+    """是否支持巨潮公告通道。巨潮只收录沪深京 A 股。"""
+    text = str(code or "").strip()
+    return len(text) == 6 and text.isdigit()
+
+
+#: A+H 双重上市：港股代码(5 位) -> A 股代码(6 位)。
+#:
+#: A+H 公司在港股线也受同一套证监会/交易所监管，公告会同步披露；巨潮只收录
+#: A 股线，所以查港股时改用它的 A 股代码去取，公告再归回原持仓代码。
+#:
+#: 映射不靠手工维护：仓库自带的 ``stocks.index.json``（中文名 → 规范代码
+#: + 市场）就是全集，用 ``portfolio.json`` 里本来就有的中文名去查即可。
+#: 零网络调用、零限流、无需人工维护，也无需缓存（实测全量解析只要 7 ms）。
+
+#: 股票索引的候选路径。按"是否被 git 跟踪"排序 —— CI 只能读到入库的。
+#: ``static/`` 被 .gitignore 排除，``apps/dsa-web/public/`` 才是入库的那份。
+_STOCK_INDEX_PATHS = (
+    "apps/dsa-web/public/stocks.index.json",
+    "static/stocks.index.json",
+    "data/cache/stocks.index.json",
+)
+#: 索引记录里「市场」字段表示 A 股的取值
+_CN_MARKET = "CN"
+#: 记录里规范代码的字段序号 / 中文名字段序号
+_IDX_SYMBOL, _IDX_NAME, _IDX_MARKET = 0, 2, 6
+
+_NAME_INDEX: Optional[Dict[str, List[str]]] = None
+
+
+def _load_cn_name_index() -> Dict[str, List[str]]:
+    """构建「A 股中文名 → 规范代码列表」索引。文件缺失返回空表。"""
+    global _NAME_INDEX
+    if _NAME_INDEX is not None:
+        return _NAME_INDEX
+
+    import json
+
+    index: Dict[str, List[str]] = {}
+    for rel in _STOCK_INDEX_PATHS:
+        path = Path(__file__).resolve().parents[2] / rel
+        try:
+            if not path.exists():
+                continue
+            rows = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            logger.debug("股票索引不可用 %s: %s", path, exc)
+            continue
+        for row in rows:
+            try:
+                if row[_IDX_MARKET] != _CN_MARKET:
+                    continue
+                name = str(row[_IDX_NAME]).strip()
+                symbol = str(row[_IDX_SYMBOL]).strip()
+            except (IndexError, TypeError):
+                continue
+            if name and symbol:
+                index.setdefault(name, []).append(symbol)
+        if index:
+            logger.info("A/H 映射索引已加载：%s（%d 个中文名）", rel, len(index))
+            break
+
+    _NAME_INDEX = index
+    return index
+
+
+def build_ah_map(names: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """现算 A+H 映射：``{港股5位码: A股6位裸码}``。两级来源，东财优先。
+
+    **第一级 —— 东财 A/H 官方对照表**：代码对代码的官方配对，最权威，优先用。
+
+    **第二级 —— 本地股票索引**：东财没解出来的港股，按持仓中文名查同名的
+    A 股（同一公司在两地通常同名）。零网络调用，实测 7 ms。
+
+    为什么东财在前而不是本地在前：这两级**不是二选一，东财每轮基本都会被
+    调用**（持仓里的纯港股永远本地解析不出，必然触发二级），所以换顺序不多
+    花任何一次网络请求。同样的代价下，当然用更权威的源打底。本地降级成兜底
+    后，恰好补上东财的两个盲区：连不上（代理/限流/改列名）、或表里没这只票。
+
+    两级都拿不到就**不映射**，该港股走长桥通道，不假装已覆盖。任何一级失败
+    都静默降级（缺 akshare / 代理拦截 / 限流 / 列名变更 / 空表 / 索引缺失），
+    不中断整轮扫描。
+
+    注意映射值必须是**裸 6 位**：akshare 的 ``symbol`` 不接受 ``603083.SH``
+    这种带后缀的形式，会 KeyError。
+    """
+    mapping: Dict[str, str] = {}
+    wanted = _hk_codes(names)
+
+    # ── 一级：东财官方对照表 ──
+    remote = _fetch_ah_map_eastmoney()
+    if remote:
+        hits = {code: remote[code] for code in wanted if code in remote}
+        mapping.update(hits)
+        logger.info("A/H 东财官方对照表解析出 %d 组：%s", len(hits), hits)
+    else:
+        logger.info("A/H 东财对照表不可用，改用本地索引")
+
+    # ── 二级：本地中文名索引，只补东财没解出来的 ──
+    index = _load_cn_name_index()
+    if index:
+        for code, name in (names or {}).items():
+            text = str(code or "").strip()
+            if "." not in text or text.endswith(".SH"):
+                continue
+            bare = text.split(".")[0].zfill(5)
+            if bare in mapping:
+                continue  # 东财已解出，本地不覆盖权威源
+            candidates = index.get(str(name or "").strip(), [])
+            if len(candidates) == 1:
+                mapping[bare] = candidates[0].split(".")[0]
+                logger.info("A/H 本地索引补上 %s(%s) → %s", text, name, mapping[bare])
+            elif len(candidates) > 1:
+                # 同名多只 A 股：无法确定，不猜
+                logger.warning(
+                    "A/H 映射跳过 %s(%s)：中文名「%s」匹配到多只 A 股 %s",
+                    text, name, name, candidates,
+                )
+    else:
+        logger.info("A/H 本地索引不可用")
+
+    if mapping:
+        logger.info("A/H 映射合计 %d 组：%s", len(mapping), mapping)
+    else:
+        logger.info("A/H 映射为空，%d 只港股全部走长桥通道", len(wanted))
+    return mapping
+
+
+def _hk_codes(names: Optional[Dict[str, str]]) -> List[str]:
+    """持仓里的港股 5 位码（去重、保序）。A 股码与 .SH 后缀不算。"""
+    out: List[str] = []
+    for code in (names or {}):
+        text = str(code or "").strip()
+        if "." not in text or text.endswith(".SH"):
+            continue
+        bare = text.split(".")[0].zfill(5)
+        if bare not in out:
+            out.append(bare)
+    return out
+
+
+#: 东财 A/H 对照表的候选列名。**不硬编单列** —— akshare 改列名就会静默失配，
+#: 多试几个别名，命中哪个用哪个。
+_EM_HK_COLS = ("港股代码", "港股代码 ", "hk_code", "H股代码")
+_EM_A_COLS = ("代码", "A股代码", "a_code")
+
+#: 进程内缓存。同一轮扫描只请求一次，不是跨运行缓存。
+_EM_AH_MAP: Optional[Dict[str, str]] = None
+
+
+def _normalize_hk_code(value: Any) -> str:
+    """东财港股代码归一成 5 位裸码。容忍 ``HK06166`` / ``06166.HK`` / ``06166``。"""
+    text = str(value or "").strip().upper()
+    if "." in text:
+        text = text.split(".")[0]
+    if text.startswith("HK"):
+        text = text[2:]
+    if text.isdigit() and 1 <= len(text) <= 5:
+        return text.zfill(5)
+    return ""
+
+
+def _normalize_a_code(value: Any) -> str:
+    """东财 A 股代码归一成 6 位裸码（akshare 只认裸码，带后缀会 KeyError）。"""
+    text = str(value or "").strip().upper()
+    if "." in text:
+        text = text.split(".")[0]
+    if text.startswith("SH") or text.startswith("SZ"):
+        text = text[2:]
+    if text.isdigit() and len(text) == 6:
+        return text
+    return ""
+
+
+def _fetch_ah_map_eastmoney() -> Dict[str, str]:
+    """东财 A/H 官方对照表 → ``{港股5位码: A股6位裸码}``。
+
+    只作**兜底**：本地中文名索引解析不出的港股才来这里补。理由是本地索引
+    零网络、6ms，而这里是网络调用、有被墙/限流/改列名的风险，所以放在后面。
+
+    任何失败（akshare 缺失、代理拦截、限流、列名变了、返回空表）都返回空
+    字典并记 INFO —— 拿不到就退回"不映射"，该港股走长桥通道，绝不因此
+    中断整轮扫描。
+    """
+    global _EM_AH_MAP
+    if _EM_AH_MAP is not None:
+        return _EM_AH_MAP
+
+    try:
+        import akshare as ak
+    except Exception as exc:  # noqa: BLE001
+        logger.info("akshare 不可用，跳过 A/H 东财兜底: %s", exc)
+        _EM_AH_MAP = {}
+        return _EM_AH_MAP
+
+    try:
+        df = ak.stock_zh_ah_spot_em()
+    except Exception as exc:  # noqa: BLE001 - 网络/限流/接口变更一律降级
+        logger.info("东财 A/H 对照表取不到，跳过兜底: %s", exc)
+        _EM_AH_MAP = {}
+        return _EM_AH_MAP
+
+    try:
+        columns = list(df.columns)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("东财 A/H 对照表结构异常，跳过兜底: %s", exc)
+        _EM_AH_MAP = {}
+        return _EM_AH_MAP
+
+    hk_col = next((c for c in _EM_HK_COLS if c in columns), None)
+    a_col = next((c for c in _EM_A_COLS if c in columns), None)
+    if not hk_col or not a_col:
+        logger.info(
+            "东财 A/H 对照表列名不匹配（现有列：%s），跳过兜底", columns[:12]
+        )
+        _EM_AH_MAP = {}
+        return _EM_AH_MAP
+
+    mapping: Dict[str, str] = {}
+    for hk_raw, a_raw in zip(df[hk_col], df[a_col]):
+        hk = _normalize_hk_code(hk_raw)
+        a = _normalize_a_code(a_raw)
+        # 同一港股码理论上只对应一只 A 股；撞车时不覆盖，保留先到的。
+        if hk and a:
+            mapping.setdefault(hk, a)
+
+    _EM_AH_MAP = mapping
+    if mapping:
+        logger.info("东财 A/H 对照表解析出 %d 组", len(mapping))
+    else:
+        logger.info("东财 A/H 对照表为空，跳过兜底")
+    return _EM_AH_MAP
 
 
 def default_window(days: int, *, end: date | None = None) -> tuple[date, date]:
@@ -266,238 +561,254 @@ def default_window(days: int, *, end: date | None = None) -> tuple[date, date]:
     return end_date - timedelta(days=max(int(days), 1)), end_date
 
 
-# ---------------------------------------------------------------------------
-# 舆情通道
-#
-# 巨潮只收录 A 股公告，港股公告接口（HKEXnews titleSearchServlet）对 2024 年
-# 后新格式 stockId 一律返回 recordCnt=0，目前无可用入口。因此港股改走
-# DSA 既有的 SearchService 做新闻检索。
-#
-# 两条通道的差别不在市场，而在信息源性质：
-#   cn_filing → EXCHANGE_FILING，词汇封闭、日期精确，可定级到致命
-#   any_news  → NEWS，词汇开放、日期常缺，由 CEILING_BY_SOURCE 硬顶在警告
-# A 股同时挂两条；港股只挂 any_news。哪天港交所接口打通，加一条 hk_filing
-# 进来港股自动变成双通道，不需要改动判定逻辑。
-# ---------------------------------------------------------------------------
-
-
-#: 定向负面 query 的检索词。
-#:
-#: 为什么不用泛化 query：实测同一批持仓，"公司名 + 代码 + 股票最新消息" 捞回来
-#: 的 18 条里负面信号 0 条，全是「盘中涨超5%」「港股通占比异动」「雪球股价页」
-#: 这类价格与资金流噪音；而定向 query 同样 18 条里捞出约 8 条真负面
-#: （被罚没千万 / 再遭监管降级 / 控股股东减持 / 盘中大跌近70%）。
-#:
-#: 刻意不写成 `| OR` 之类的布尔语法：Tavily 等 provider 对长 query 的处理
-#: 差异大，堆词比列词更稳。
-NEGATIVE_QUERY_TERMS: tuple[str, ...] = (
-    "亏损", "调查", "处罚", "违规", "停牌", "被查", "造假", "减持",
-    "诉讼", "退市", "问询", "爆雷", "暴跌", "重挫", "清盘", "核数师",
-    "盈利警告", "股东质押", "债务违约",
-)
-
-
-def _build_news_query(code: str, name: str) -> str:
-    """构造定向负面 query。
-
-    **必须同时带公司名和裸代码**：只带名字会串到 A 股同名公司
-    （实测「剑桥科技」会捞到 603083 的违规记录，那是一只完全不同的股票）。
-    """
-    bare = str(code or "").split(".")[0].strip()
-    parts = [name, bare] if bare and bare != name else [name]
-    return " ".join(parts) + " " + " ".join(NEGATIVE_QUERY_TERMS)
-
-
-#: 静态档案页 / 行情页特征。这类 URL 是券商和门户的**常驻个股页面**，
-#: 标题里带负面词但没有事件时间（实测新浪 `违规记录` 页、���球 `股价行情` 页
-#: 会被定向 query 稳定捞到）。它们不是新闻，必须丢掉。
-_ARCHIVE_PAGE_RE = re.compile(
-    r"(违规记录|股价_股价行情|历史行情|股票股价_|公司高管_|资料档案"
-    r"|_行情中心|个股主页|F10|十大股东|公司简介)"
-)
-
-#: 大盘级汇总清单。这些文章列举了 N 家公司，某只票恰好在名单里就被检索命中，
-#: 但它并没有针对这只票发生任何事。中文财经媒体的"周末利空盘点"极其泛滥，
-#: 模式必须写得很宽 —— 实测「雷来了！周末31股利空」「5家被罚，4个立案，
-#: 38家诉讼」这类标题用最初那版规则完全挡不住。
-_ROUNDUP_RE = re.compile(
-    r"(\d+\s*家公司|\d+\s*家(被罚|立案|退市|诉讼|问询)"
-    r"|\d+\s*股(利空|涨停|跌停|爆雷|异动|集体)"
-    r"|周末\d*|隔夜|一觉醒来|雷来了|集体爆雷|集体重挫|集体涨停|批量爆雷|批量退市"
-    r"|避雷清单|避雷|盘点|名单|汇总|排行"
-    r"|涨停板复盘|跌停板复盘|龙虎榜|今日涨停|今日跌停"
-    r"|盘前必读|早间速览|市场参考|财经早餐|每日复盘|收评|午评|复盘)"
-)
-
-
-def is_usable_news(title: str, url: str = "") -> bool:
-    """判断一条检索结果是不是**针对该标的**的真实负面舆情。
-
-    挡掉两类噪音：静态档案页、大盘汇总清单。
-    """
-    text = f"{title} {url}"
-    if _ARCHIVE_PAGE_RE.search(text):
-        return False
-    if _ROUNDUP_RE.search(title or ""):
-        return False
-    return True
-
-
-#: URL 里的日期。中文财经媒体的 URL 常见四种形态：
-#:   /article/20260716/herald/   连续 8 位
-#:   /a/202603263686001829.html  14 位毫秒时间戳，8 位日期**嵌在更长数字串中间**
-#:   /2019-07-05/101436127.html  带横线
-#:   /detail/2461205             无日期
-#: 所以要同时匹配"8 位连续"和"带横线"两种，且**不能**给连续位加 ``(?!\d)``
-#: 边界（会漏掉时间戳形态）；误配靠"日期是否合法 + 是否是未来"来挡。
-_URL_DATE_RES = (
-    re.compile(r"(?<!\d)(20\d{2})(\d{2})(\d{2})"),
-    re.compile(r"(?<!\d)(20\d{2})[-/](\d{2})[-/](\d{2})(?!\d)"),
-)
-#: 认不出来时的哨兵日期。**绝不能用"今天"** —— 事件指纹里含 publish_date，
-#: 每天都填今天的话指纹天天变，同一条新闻会被判定成"新事件"反复推送。
+#: 认不出来日期时的哨兵值。**绝不能用"今天"** —— 事件指纹里含 publish_date，
+#: 每天都填今天的话指纹天天变，同一条新闻会被判定成“新事件”反复推送。
 _UNKNOWN_DATE = "1970-01-01"
 
 
-def extract_date(url: str, fallback: str = _UNKNOWN_DATE) -> str:
-    """从 URL 抽发布日期，抽不到返回 ``fallback``。
+# ---------------------------------------------------------------------------
+# 长桥通道
+#
+# 港股唯一的外部信息源。巨潮只收 A 股，而港交所公告接口
+# （HKEXnews titleSearchServlet）对 2024 年后新格式 stockId 一律返回
+# recordCnt=0，目前无可用入口 —— 港股风险全靠这里。
+#
+# 代价：ContentContext / FundamentalContext 不像 QuoteContext 那样由 SDK
+# 内部限流，服务端限制 1 秒 1 次，超出报 429002。每日批量任务总调用量不过
+# 50 次，1.2 秒间隔即可 —— 与运行频率无关，不是吞吐问题。
+# ---------------------------------------------------------------------------
 
-    通用网页搜索不返回 ``published_date``，但中文财经媒体的 URL 普遍带日期。
-    校验不通过就返回哨兵日期而不是"今天"：指纹必须稳定，否则同一条新闻
-    每天都被当成新事件重推。
+#: 长桥内容类接口的最小调用间隔（秒）
+_LB_MIN_INTERVAL = 1.2
+
+#: 社区话题的负面情绪预筛词。topics 每天 50 条，**不能全送 LLM**，
+#: 只把命中这些词的帖子留下。
+_NEGATIVE_SENTIMENT_TERMS: tuple[str, ...] = (
+    "trapped", "bagholder", "cut loss", "stop loss", "panic", "liquidat",
+    "margin call", "forced", "bearish", "crash", "plunge", "scam",
+    "fraud", "probe", "investigation", "lawsuit", "delist", "suspend",
+    "halt", "winding", "bankrupt", "default", "miss payment", "blow up",
+    "套牢", "割肉", "止损", "爆仓", "平仓", "被套", "阴跌", "暴跌", "崩",
+    "维权", "做空", "造假", "调查", "起诉", "停牌", "退市", "破产", "违约",
+)
+
+#: 财报净利为负。corp_action 的 act_desc 形如
+#: ``FY2026 Q2 Earning Release (CNY) Revenue 633.93 M, Net Income -72.39 M``
+_LOSS_RE = re.compile(r"Net\s+Income\s+(-?[\d,]+\.?\d*)\s*([MKB]?)", re.IGNORECASE)
+_LOSS_SCALE = {"M": 1e6, "B": 1e9, "K": 1e3, "": 1.0}
+
+
+def _lb_contexts():
+    """构建长桥 Content / Fundamental 上下文。任一失败返回 None。
+
+    必须先 ``import src.config``：它负责把 ``.env`` 载入 ``os.environ``。
+    长桥 SDK 的 ``Config.from_apikey_env()`` 只读环境变量，绕开 config 就会
+    报 ``missing environment variable: LONGBRIDGE_APP_KEY``（本地必现）。
+    CI 里环境变量由 workflow env 注入，但统一走 config 更稳。
     """
-    text = str(url or "")
-    today = date.today()
-    for pattern in _URL_DATE_RES:
-        for match in pattern.finditer(text):
-            year, month, day = match.groups()
-            try:
-                parsed = date(int(year), int(month), int(day))
-            except ValueError:
-                continue
-            if parsed > today + timedelta(days=2):
-                continue  # 未来日期，多半是编号而非日期
-            return parsed.isoformat()
-    return fallback
+    try:
+        import longbridge.openapi as lbo
+
+        from src.config import get_config  # noqa: F401 - 副作用：加载 .env
+
+        get_config()
+        cfg = lbo.Config.from_apikey_env()
+        return lbo.ContentContext(cfg), lbo.FundamentalContext(cfg)
+    except Exception as exc:  # noqa: BLE001 - 缺凭证/SDK 未装都走这里
+        logger.info("长桥通道不可用，跳过: %s", exc)
+        return None, None
 
 
-def fetch_news(
+def _is_negative_sentiment(text: str) -> bool:
+    low = str(text or "").lower()
+    return any(term in low for term in _NEGATIVE_SENTIMENT_TERMS)
+
+
+def _lb_date(value: Any) -> str:
+    """长桥时间戳 → YYYY-MM-DD；解析不出用哨兵值。"""
+    text = str(value or "").strip()
+    if not text:
+        return _UNKNOWN_DATE
+    head = text.replace("/", "-").split(" ")[0].split("T")[0]
+    if len(head) == 8 and head.isdigit():
+        return f"{head[:4]}-{head[4:6]}-{head[6:8]}"
+    try:
+        return date.fromisoformat(head).isoformat()
+    except ValueError:
+        return _UNKNOWN_DATE
+
+
+def _earnings_loss_events(fc, code: str, name: str) -> List[Announcement]:
+    """从 corp_action 提取「财报净利为负」，并统计**真正的**连续亏损季数。
+
+    两个关键点：
+
+    1. ``it.date`` 是 8 位带年份（``20260923``），``it.date_str`` 只有月.日
+       （``09.23``）。必须用前者，否则年份丢失会落进哨兵值。
+    2. corp_action 的列表**不是按时间连续排列的**（同一财年的 Q2/Q4 混排），
+       所以必须先按日期**正序**再从最新往回数；遇到第一个非负就**停止**，
+       而不是清零后继续数 —— 后者会把"FY2024Q2 亏、FY2023Q4 亏"误算成连续。
+    3. 只输出一条汇总，不逐季刷屏。
+    """
+    try:
+        items = list(fc.corp_action(code).items)
+    except Exception as exc:  # noqa: BLE001 - 非 A+H 标的会报网络错，属正常
+        logger.debug("corp_action 不可用 %s: %s", code, exc)
+        return []
+
+    # 正序：最老 → 最新
+    ordered = sorted(items, key=lambda x: str(x.date or ""))
+    losses: List[Tuple[str, float]] = []
+    for it in ordered:
+        if "Earning" not in str(it.act_type or ""):
+            continue
+        match = _LOSS_RE.search(str(it.act_desc or ""))
+        if not match:
+            continue
+        try:
+            value = float(match.group(1).replace(",", "")) * _LOSS_SCALE.get(
+                match.group(2).upper(), 1.0
+            )
+        except ValueError:
+            continue
+        losses.append((_lb_date(it.date or it.date_str), value))
+
+    if not losses:
+        return []
+
+    # 从最新往回数，遇到非负立即停止
+    consecutive = 0
+    for _, value in reversed(losses):
+        if value >= 0:
+            break
+        consecutive += 1
+
+    if consecutive == 0:
+        return []
+
+    latest_date, latest_value = losses[-1]
+    desc = next(
+        (str(i.act_desc) for i in reversed(ordered)
+         if "Earning" in str(i.act_type or "") and _LOSS_RE.search(str(i.act_desc or ""))),
+        "财报",
+    )
+    label = (
+        f"{name} {desc[:56]}（净利 {_fmt_amount(latest_value)}，"
+        f"已连续 {consecutive} 个季度为负）"
+    )
+    return [Announcement(
+        code=code, name=name, title=label, publish_date=latest_date,
+        url="", source="longbridge:corp_action",
+        source_type=SourceType.EXCHANGE_FILING,
+    )]
+
+
+def _fmt_amount(value: float) -> str:
+    """把净利金额格式化成可读形式。``value`` 已是负数，不要再拼负号。"""
+    magnitude = abs(value)
+    if magnitude >= 1e9:
+        return f"{value / 1e9:.2f}B"
+    if magnitude >= 1e6:
+        return f"{value / 1e6:.1f}M"
+    if magnitude >= 1e3:
+        return f"{value / 1e3:.0f}K"
+    return f"{value:.0f}"
+
+
+def fetch_longbridge(
     codes: Iterable[str],
     *,
     names: Optional[Dict[str, str]] = None,
-    days: int = 30,
-    max_results: int = 8,
-    delay: float = 0.4,
+    news_markets: str = "ALL",
+    include_news: bool = True,
+    include_topics: bool = True,
+    include_earnings: bool = True,
+    max_news: int = 10,
+    max_topics: int = 10,
+    interval: float = _LB_MIN_INTERVAL,
 ) -> Dict[str, List[Announcement]]:
-    """按只检索**负面舆情**，返回 ``{code: [Announcement(source_type=NEWS), ...]}``。
+    """经长桥取资讯、社区负面情绪与财报异常。
 
-    与 ``SearchService.search_stock_news`` 的区别有三点，都是必须的：
+    ``news_markets`` 控制哪些市场跑 news/topics，默认 **ALL（全市场）**：
 
-    1. **定向 query**：自带负面检索词，而不是"股票最新消息"这种泛化查询。
-    2. **不走 ``focus_keywords``**：该参数在 ``search_service.py:4050`` 会把
-       query 整个替换成关键词拼接，公司名和代码被丢弃，实测三家不同公司会
-       返回完全相同的一批结果。这里自己拼 query，直接调 provider 层。
-    3. **丢掉相关性准入**：``search_stock_news`` 的相关性打分是为泛化 query
-       设计的；定向 query 下不再需要，兜底交给 LLM 分类。
+    * 传 ``"HK"`` 可退回只跑港股。A 股的长桥 news 实测基本是「三大指数低开」
+      「某概念板块普跌」这类大盘综述，不是该股的事；且 A 股本来就有巨潮这个
+      高质量结构化源，长桥的增量价值有限。删掉 Web 舆情通道后，A股若还想有
+      任何外部新闻信号，就只能靠这里 —— 故默认全市场跑。
+    * 港股无论如何必跑：没有公告通道，长桥的资讯/社区是唯一外部信号。
 
-    ``days`` 是**舆情专用窗口**，与公告窗口（``RISK_SCAN_WINDOW_DAYS``）
-    无关：舆情讲"最近出了什么事"，公告要还原"这件事走到哪一步了"。
+    ``corp_action``（财报）不受此限制，永远全市场跑 —— 它是确定性数据，
+    沃格光电那种「连续四个季度净利为负」只能从这里拿到。
 
-    窗口由**本模块自己**执行过滤，不依赖 provider：通用网页搜索的
-    ``days`` 参数不被强制执行（Tavily 只在 ``topic="news"`` 下认它，
-    而 ``topic="news"`` 会把中文小盘港股查询路由到国际新闻索引、零覆盖）。
-    所以策略是「provider 照常返回，本地按 URL 抽出的日期筛」。
-    抽不出日期的条目一律保留 —— 无法证明它旧，就不该丢。
-
-    ``published_date`` 通常为空；万一有值优先用它。
+    注意：全市场跑 news/topics 会把每只票的调用次数从 1 次拉到 3 次
+    （news + topics + corp_action），16 只持仓约 48 次，按 1.2 秒节流
+    约 58 秒。相比只跑港股多花约 40 秒。
     """
-    try:
-        from src.search_service import get_search_service
-    except Exception as exc:  # noqa: BLE001 - 缺依赖时舆情通道整体降级
-        logger.warning("SearchService 不可用，舆情通道跳过: %s", exc)
+    cc, fc = _lb_contexts()
+    if cc is None and fc is None:
         return {}
 
     name_map = names or {}
-    try:
-        service = get_search_service()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("SearchService 初始化失败，舆情通道跳过: %s", exc)
-        return {}
+    hk_news_only = str(news_markets or "").strip().upper() in ("HK", "港股")
+    out: Dict[str, List[Announcement]] = {}
+    last = [0.0]
 
-    if not service._providers:
-        logger.warning("未配置任何搜索 provider，舆情通道静默跳过")
-        return {}
+    def _throttle() -> None:
+        gap = time.monotonic() - last[0]
+        if gap < interval:
+            time.sleep(interval - gap)
+        last[0] = time.monotonic()
 
-    cutoff = date.today() - timedelta(days=max(int(days), 1))
-    results: Dict[str, List[Announcement]] = {}
     for code in codes:
         key = str(code or "").strip()
         if not key:
             continue
         display = name_map.get(key, key)
-        query = _build_news_query(key, display)
-
-        response = None
-        for provider in service._providers:
-            # 刻意**不传 topic="news"**。实测带 topic 会把查询路由到 Tavily 的
-            # 国际新闻索引，中文小盘港股零覆盖：速腾聚创返回
-            # 「UWM Holdings Sued for Securities Fraud」、剑桥科技返回
-            # 「Super Micro Computer Investigation」，完全无关。
-            # 通用网页搜索反而能捞到「美尚生态财务造假，五家券商被连带起诉」
-            # 这类真信号（广发就在其中）。
-            try:
-                response = provider.search(query, max_results=max_results, days=days)
-            except Exception as exc:  # noqa: BLE001 - 单个 provider 失败换下一个
-                logger.debug("provider %s 查询失败 %s: %s", provider.name, key, exc)
-                continue
-            if response is not None and getattr(response, "results", None):
-                break
-            response = None
-
-        if response is None:
-            logger.debug("舆情检索无结果 %s(%s)", display, key)
-            results[key] = []
-            continue
-
         rows: List[Announcement] = []
-        dropped = 0
-        stale = 0
-        for item in response.results or []:
-            if not is_usable_news(item.title or "", item.url or ""):
-                dropped += 1
-                continue
-            publish = item.published_date or extract_date(item.url or "")
-            # 时间窗口由本模块执行。哨兵日期（URL 里抽不到）**保留** ——
-            # 无法证明它旧，就不该因为猜了个日期把它丢掉。
-            if publish != _UNKNOWN_DATE:
-                try:
-                    if date.fromisoformat(publish) < cutoff:
-                        stale += 1
+        want_news = include_news and (
+            not hk_news_only or key.upper().endswith(".HK")
+        )
+
+        if want_news and cc is not None:
+            _throttle()
+            try:
+                for item in (cc.news(key) or [])[:max_news]:
+                    rows.append(Announcement(
+                        code=key, name=display, title=item.title or "",
+                        publish_date=_lb_date(item.published_at),
+                        url=item.url or "", source="longbridge:news",
+                        source_type=SourceType.NEWS,
+                    ))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("长桥资讯失败 %s: %s", key, exc)
+
+        if want_news and include_topics and cc is not None:
+            _throttle()
+            try:
+                for item in (cc.topics(key) or []):
+                    text = item.description or ""
+                    if not _is_negative_sentiment(text):
                         continue
-                except ValueError:
-                    pass
-            rows.append(
-                Announcement(
-                    code=key,
-                    name=display,
-                    title=item.title,
-                    # 绝不填"今天"：事件指纹含 publish_date，天天变会导致
-                    # 同一条新闻被当成新事件反复推送。
-                    publish_date=publish,
-                    url=item.url,
-                    source=f"news:{response.provider or 'unknown'}",
-                    source_type=SourceType.NEWS,
-                )
-            )
-        if dropped or stale:
-            logger.debug(
-                "%s(%s) 滤掉 %d 条档案页/汇总、%d 条超窗(>%d天)",
-                display, key, dropped, stale, days,
-            )
-        results[key] = rows
-        if delay:
-            time.sleep(delay)
-    return results
+                    if len(rows) >= max_news + max_topics:
+                        break
+                    rows.append(Announcement(
+                        code=key, name=display,
+                        title=f"[社区情绪] {text[:100]}",
+                        publish_date=_lb_date(item.published_at),
+                        url=item.url or "", source="longbridge:topics",
+                        source_type=SourceType.NEWS,
+                    ))
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("长桥社区话题失败 %s: %s", key, exc)
+
+        if include_earnings and fc is not None:
+            _throttle()
+            rows.extend(_earnings_loss_events(fc, key, display))
+
+        if rows:
+            rows.sort(key=lambda a: a.publish_date, reverse=True)
+            out[key] = rows
+    return out
 
 
 # ---------------------------------------------------------------------------

@@ -677,12 +677,14 @@ def evaluate_stock(
     """对单只持仓做完整判定。"""
     all_events = _build_events(announcements, as_of, triage)
 
-    # 只有 REGULATORY 事件进风险阶梯；股东行为 / 公司运作 / 利好单独收集，
-    # 报告里另起一段，不影响定级。
-    events = [e for e in all_events if e.event_class is EventClass.REGULATORY]
-    other_events = [
-        e for e in all_events if e.event_class is not EventClass.REGULATORY
-    ]
+    # 进风险阶梯的是「监管」与「财务异常」两类：
+    #   监管  —— 来自公告或舆情
+    #   财务  —— 来自长桥 corp_action 的财报口径（确定性数据，不受舆情封顶）
+    # 其余（股东行为 / 公司运作 / 利好）单独收集，报告里另起段落。
+    # 财务事件**不能**进 other_events —— 它已经进了阶梯，两边都放会重复。
+    in_ladder = (EventClass.REGULATORY, EventClass.FUNDAMENTAL)
+    events = [e for e in all_events if e.event_class in in_ladder]
+    other_events = [e for e in all_events if e.event_class not in in_ladder]
 
     verdict = RiskVerdict(
         code=code,

@@ -31,6 +31,22 @@ from .rules import EventClass, RiskLevel, SourceType
 logger = logging.getLogger(__name__)
 
 DEFAULT_STATE_PATH = "data/risk_scan_state.json"
+DEFAULT_TITLE = "🛡️ 持仓排雷"
+
+#: 推送正文首行。用 H1 而非加粗：Server酱 / 飞书等渠道把 Markdown 一级标题
+#: 渲染成通知栏的主视觉，而渠道自身的 title 字段是 DSA 硬编码的
+#: ``📈 股票分析报告``（``Serverchan3Sender.send`` 的默认值），改它需要动
+#: ``src/notification.py`` —— 那是既有代码，不碰。所以标题只能做在正文里。
+_TITLE_ENV = "RISK_SCAN_TITLE"
+
+
+def resolve_title(title: Optional[str] = None) -> str:
+    """报告标题：显式参数 > 环境变量 > 默认。"""
+    if title:
+        return str(title).strip()
+    env = (os.environ.get(_TITLE_ENV) or "").strip()
+    return env or DEFAULT_TITLE
+
 
 # RiskLevel -> NotificationService severity
 _SEVERITY_MAP = {
@@ -166,7 +182,7 @@ def build_markdown(
     push_min_level: RiskLevel = RiskLevel.WARNING,
     state: Optional[Dict[str, Any]] = None,
     new_map: Optional[Dict[str, List[str]]] = None,
-    title: str = "持仓排雷",
+    title: Optional[str] = None,
 ) -> str:
     """生成排雷 markdown 报告（三段式）。
 
@@ -176,8 +192,9 @@ def build_markdown(
     """
     actionable = report.actionable(push_min_level)
     new_codes = set(new_map or {})
+    heading = resolve_title(title)
     lines: List[str] = [
-        f"**{title}** · {report.as_of}",
+        f"# {heading} · {report.as_of}",
         "",
         f"扫描窗口 {report.window_start} ~ {report.window_end}　"
         f"持仓 {report.total_positions} 只（覆盖 {report.covered_count}，"
@@ -256,7 +273,23 @@ def build_markdown(
             if verdict.downgrade_reason:
                 lines.append(f"    ⤷ {verdict.downgrade_reason}")
 
-    # ── 第三段：利好 / 其它动向（不参与风险定级）──
+    # ── 财务异常（交易所口径的确定性数据）──
+    fin_rows = [
+        (v, e) for v in report.sorted_verdicts()
+        for e in v.events if e.event_class.value == "fundamental"
+    ]
+    if fin_rows:
+        lines.append("")
+        lines.append("📉 **财务异常**（财报口径，不受舆情封顶限制）")
+        seen_fin: set = set()
+        for verdict, event in fin_rows:
+            key = (verdict.code, event.publish_date)
+            if key in seen_fin:
+                continue
+            seen_fin.add(key)
+            lines.append(f"- {event.title}")
+
+    # ── 其它段：利好 / 股东行为 / 公司运作 ──
     positives = [
         (v, e) for v in report.sorted_verdicts() for e in v.positive_events
     ]

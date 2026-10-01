@@ -21,18 +21,13 @@ on:
         required: false
         default: '180'
         type: string
-      news_days:
-        description: '舆情检索窗口天数（默认 30，与公告窗口独立）'
-        required: false
-        default: '30'
-        type: string
       push_min_level:
         description: '达到该等级才推送：clear/watch/warning/high/critical'
         required: false
         default: 'warning'
         type: string
       with_news:
-        description: '是否启用舆情检索通道（A 股 + 港股）'
+        description: '是否启用长桥资讯/社区情绪通道（港股信号全靠它）'
         required: false
         default: true
         type: boolean
@@ -148,9 +143,6 @@ jobs:
           # ==========================================
           RISK_SCAN_JSON_PATH: ${{ github.event.inputs.portfolio_path || vars.RISK_SCAN_JSON_PATH || 'data/portfolio.json' }}
           RISK_SCAN_WINDOW_DAYS: ${{ github.event.inputs.window_days || vars.RISK_SCAN_WINDOW_DAYS || '180' }}
-          # 舆情窗口与公告窗口相互独立：舆情讲"最近出了什么事"（短），
-          # 公告要还原"这件事走到哪一步了"（长）。
-          RISK_SCAN_NEWS_WINDOW_DAYS: ${{ github.event.inputs.news_days || vars.RISK_SCAN_NEWS_WINDOW_DAYS || '30' }}
           # 推送门槛：全绿日不推送，避免每天一条"今天没有雷"把通知渠道磨没。
           # 想让关注档（WATCH）也推，改成 watch。
           RISK_SCAN_PUSH_MIN_LEVEL: ${{ github.event.inputs.push_min_level || vars.RISK_SCAN_PUSH_MIN_LEVEL || 'warning' }}
@@ -164,19 +156,13 @@ jobs:
           # 两边本来读的就是同一份 portfolio.json。
           # raw URL 本身是访问令牌，属敏感信息，放 secrets。
           POSITION_DRAWDOWN_GIST_URL: ${{ vars.POSITION_DRAWDOWN_GIST_URL || secrets.POSITION_DRAWDOWN_GIST_URL || '' }}
-          # 舆情检索通道开关。关掉后只跑交易所公告通道，港股将无任何信号。
+          # 长桥通道开关。关掉后港股资讯与社区情绪、财报口径全部不跑。
           RISK_SCAN_WITH_NEWS: ${{ github.event.inputs.with_news && '1' || vars.RISK_SCAN_WITH_NEWS || '1' }}
-          # ── 舆情通道依赖 LLM 搜索 provider 与新闻时效窗口 ──
-          # SearchService 默认 NEWS_STRATEGY_PROFILE=short 只有 3 天窗口，
-          # 会把所有结果滤掉（provider=Filtered）。排雷要看得更久。
-          NEWS_STRATEGY_PROFILE: 'long'
-          NEWS_MAX_AGE_DAYS: '90'
+          # ── LLM 兜底通道 ──
           LLM_MINIMAX_API_KEY: ${{ secrets.LLM_MINIMAX_API_KEY }}
           LLM_MINIMAX_BASE_URL: ${{ vars.LLM_MINIMAX_BASE_URL || secrets.LLM_MINIMAX_BASE_URL }}
           LLM_MINIMAX_MODELS: ${{ vars.LLM_MINIMAX_MODELS || secrets.LLM_MINIMAX_MODELS }}
           LLM_MINIMAX_PROTOCOL: ${{ vars.LLM_MINIMAX_PROTOCOL || 'anthropic' }}
-          TAVILY_API_KEYS: ${{ secrets.TAVILY_API_KEYS }}
-          SEARXNG_BASE_URLS: ${{ vars.SEARXNG_BASE_URLS || secrets.SEARXNG_BASE_URLS }}
 
         run: |
           # ── 1) 决定持仓文件来源：Gist 优先，回退仓库内路径 ──
@@ -248,7 +234,7 @@ jobs:
           fi
 
           echo ">>> 持仓文件: $PORTFOLIO"
-          echo ">>> 公告窗口 ${RISK_SCAN_WINDOW_DAYS} 天　舆情窗口 ${RISK_SCAN_NEWS_WINDOW_DAYS} 天"
+          echo ">>> 公告窗口 ${RISK_SCAN_WINDOW_DAYS} 天"
           echo ">>> 推送门槛: $RISK_SCAN_PUSH_MIN_LEVEL"
 
           REPORT_DATE=$(date +%F)

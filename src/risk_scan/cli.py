@@ -1,4 +1,4 @@
-"""排雷扫描 CLI 入口。
+﻿"""排雷扫描 CLI 入口。
 
 用法
 ----
@@ -38,7 +38,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from .engine import evaluate_holdings, split_coverage
-from .fetcher import default_window, fetch_announcements, fetch_news
+from .fetcher import default_window, fetch_announcements
 from .notifier import (
     build_markdown,
     load_state,
@@ -144,7 +144,7 @@ def run(
     state_path: Optional[str] = None,
     with_news: Optional[bool] = None,
     with_triage: Optional[bool] = None,
-    news_days: Optional[int] = None,
+    with_earnings: Optional[bool] = None,
     crosscheck: bool = True,
 ) -> int:
     """执行一次排雷扫描，返回退出码。"""
@@ -174,8 +174,10 @@ def run(
         with_news = os.environ.get("RISK_SCAN_WITH_NEWS", "1").lower() not in (
             "0", "false", "no",
         )
-    if news_days is None:
-        news_days = int(os.environ.get("RISK_SCAN_NEWS_WINDOW_DAYS", "30"))
+    if with_earnings is None:
+        with_earnings = os.environ.get("RISK_SCAN_WITH_EARNINGS", "1").lower() not in (
+            "0", "false", "no",
+        )
     if with_triage is None:
         with_triage = os.environ.get("RISK_SCAN_LLM_TRIAGE", "1").lower() not in (
             "0", "false", "no",
@@ -209,24 +211,32 @@ def run(
     # ── 通道一：交易所公告（仅 A 股）──
     try:
         announcements = fetch_announcements(
-            codes, start=start, end=end, crosscheck=crosscheck
+            codes, names=names, start=start, end=end, crosscheck=crosscheck
         )
     except Exception as exc:  # noqa: BLE001 - 抓取层异常不应让 CLI 崩掉
         logger.exception("公告抓取失败: %s", exc)
         print(f"ERROR: 公告抓取失败: {exc}", file=sys.stderr)
         return 4
 
-    # ── 通道二：负面舆情检索（A 股 + 港股）──
-    news_count = 0
-    if with_news:
+    # ── 通道二：长桥（资讯/社区情绪/财报，全市场）──
+    lb_rows: Dict[str, Any] = {}
+    if with_news or with_earnings:
         try:
-            news = fetch_news(codes, names=names, days=news_days)
-            news_count = sum(len(v) for v in news.values())
-            for code, rows in news.items():
+            from .fetcher import fetch_longbridge
+
+            lb_rows = fetch_longbridge(
+                codes, names=names,
+                include_news=with_news, include_topics=with_news,
+                include_earnings=with_earnings,
+            )
+            logger.info(
+                "长桥通道取回 %d 条（覆盖 %d 只）",
+                sum(len(v) for v in lb_rows.values()), len(lb_rows),
+            )
+            for code, rows in lb_rows.items():
                 announcements.setdefault(code, []).extend(rows)
-            logger.info("舆情通道取回 %d 条新闻", news_count)
-        except Exception as exc:  # noqa: BLE001 - 舆情是补充通道，失败不影响主判定
-            logger.warning("舆情通道失败（不影响公告判定）: %s", exc)
+        except Exception as exc:  # noqa: BLE001 - 补充通道，失败不影响主判定
+            logger.warning("长桥通道失败（不影响公告判定）: %s", exc)
 
     # ── LLM 兜底判定（可选，失败不影响主流程）──
     triage: Optional[Dict[Any, Any]] = None
@@ -317,7 +327,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--no-crosscheck", action="store_true", help="跳过零结果的巨潮 raw 反查"
     )
     parser.add_argument(
-        "--no-news", action="store_true", help="跳过舆情检索通道（只用交易所公告）"
+        "--no-news", action="store_true", help="跳过长桥资讯/社区情绪（只用交易所公告 + 财报）"
     )
     parser.add_argument(
         "--state",
@@ -329,10 +339,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         "--no-triage", action="store_true", help="跳过 LLM 兜底判定（只用确定性规则）"
     )
     parser.add_argument(
-        "--news-days",
-        type=int,
-        default=None,
-        help="舆情检索窗口天数（默认 30，与公告窗口相互独立）",
+        "--no-earnings",
+        action="store_true",
+        help="跳过长桥财报通道（连续亏损检测）",
     )
     parser.add_argument("--report-file", type=str, default=None, help="markdown 报告输出路径")
     parser.add_argument("--verbose", "-v", action="store_true", help="输出 debug 日志")
@@ -358,7 +367,8 @@ def main(argv: Optional[List[str]] = None) -> int:
         state_path=args.state,
         with_news=False if args.no_news else None,
         with_triage=False if args.no_triage else None,
-        news_days=args.news_days,
+        with_earnings=False if args.no_earnings else None,
+
         crosscheck=not args.no_crosscheck,
     )
 

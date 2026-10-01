@@ -97,6 +97,7 @@ class EventClass(str, Enum):
     SHAREHOLDER = "shareholder"  # 减持/质押/解禁，不进阶梯
     CORPORATE = "corporate"      # 担保/增发/收购，不进阶梯
     POSITIVE = "positive"        # 利好，不进阶梯，单列一段
+    FUNDAMENTAL = "fundamental"  # 财务异常（连续亏损），确定性数据，进阶梯
 
 
 #: 广撒网预筛词 —— 只决定"这条要不要送 LLM 判"，本身不产生任何等级。
@@ -404,6 +405,50 @@ NEWS_RULES: tuple[RiskRule, ...] = (
         "停牌", RiskLevel.WARNING, "港股交易", AGGRAVATING, 90,
         "港股停牌（港台用词，两体同形）", source_type=SourceType.NEWS,
     ),
+    # --- 英文（长桥 content.news 对港股返回的标题是英文的）---
+    # 上面所有简中词对英文标题一个都匹配不上。这些是快速通道，
+    # 真正兜底靠 LLM —— 规则命中只为省调用、少噪音。
+    RiskRule(
+        "profit warning", RiskLevel.WARNING, "港股业绩", AGGRAVATING, 180,
+        "Profit warning（英文）", source_type=SourceType.NEWS,
+    ),
+    RiskRule(
+        "trading halt", RiskLevel.WARNING, "港股交易", AGGRAVATING, 90,
+        "Trading halt（英文）", source_type=SourceType.NEWS,
+    ),
+    RiskRule(
+        "delisting", RiskLevel.WARNING, "港股交易", AGGRAVATING, 365,
+        "Delisting（英文）", source_type=SourceType.NEWS,
+    ),
+    RiskRule(
+        "winding up", RiskLevel.WARNING, "港股交易", AGGRAVATING, 365,
+        "Winding up（英文）", source_type=SourceType.NEWS,
+    ),
+    RiskRule(
+        "auditor", RiskLevel.WATCH, "港股财报", AGGRAVATING, 365,
+        "Auditor（英文）", source_type=SourceType.NEWS,
+    ),
+    RiskRule(
+        "investigation", RiskLevel.WARNING, "港股监管", AGGRAVATING, 180,
+        "Regulatory investigation（英文）", source_type=SourceType.NEWS,
+    ),
+)
+
+#: 财务异常规则 —— 来自长桥 corp_action 的财报口径，是确定性数据。
+#:
+#: 与舆情不同，它不受「舆情封顶在警告」的限制：交易所披露的连续亏损
+#: 本身就是事实，不需要模型判断。
+FINANCIAL_RULES: tuple[RiskRule, ...] = (
+    RiskRule(
+        "连续", RiskLevel.WARNING, "财务", AGGRAVATING, 180,
+        "连续 2 个及以上季度净利为负",
+        event_class=EventClass.FUNDAMENTAL,
+    ),
+    RiskRule(
+        "净利为负", RiskLevel.WARNING, "财务", AGGRAVATING, 90,
+        "单季度净利为负",
+        event_class=EventClass.FUNDAMENTAL,
+    ),
 )
 
 # 两张表的合并视图，供 :func:`match_rules` 按 source_type 过滤使用。
@@ -415,10 +460,11 @@ def rules_for(source_type: SourceType) -> tuple[RiskRule, ...]:
 
     利好规则对两种来源都生效：公告里的回购公告要认，舆情里捞到的回购消息
     同样要认 —— 否则港股（没有公告通道）会完全看不到利好。
+    财务异常只认交易所口径（长桥 corp_action），不用于舆情。
     """
     if source_type is SourceType.NEWS:
         return NEWS_RULES + POSITIVE_RULES
-    return FILING_RULES + POSITIVE_RULES
+    return FILING_RULES + POSITIVE_RULES + FINANCIAL_RULES
 
 
 def needs_broad_scan(title: str) -> bool:
@@ -476,12 +522,18 @@ def match_rules(
     text = normalize_title(title)
     if not text:
         return []
+    # 英文关键词大小写敏感（长桥对港股返回的标题是 "Profit Warning"，
+    # 关键词写作 "profit warning"）。中文无大小写，统一转小写不影响中文规则。
+    text = text.lower()
 
     table = rules_for(source_type)
 
     hit: List[RiskRule] = []
     for rule in table:
-        if rule.keyword in text:
+        # 标题和关键词必须用同一套归一化。标题侧 normalize_title 会去掉
+        # 所有空白，关键词若保留空格就永远匹配不上（"Profit Warning"
+        # → "profitwarning" vs 关键词 "profit warning"）。
+        if normalize_title(rule.keyword).lower() in text:
             hit.append(rule)
 
     if not any(r.polarity == MITIGATING for r in hit):

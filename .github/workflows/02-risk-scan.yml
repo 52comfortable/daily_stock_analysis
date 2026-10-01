@@ -1,0 +1,305 @@
+name: 持仓排雷监控
+
+on:
+  # 定时触发 - 每天北京时间 22:30 (UTC 14:30)
+  # 刻意排在持仓预警(18:30)之后：A股公告绝大多数在盘后 15:00-22:00 发布，
+  # 17:30 跑会漏掉当天晚上那批最要紧的。22:30 能覆盖当天绝大部分。
+  # 漏掉的 22:00-24:00 极少数也不真丢 —— 扫描窗口 180 天滚动，次日补上。
+  schedule:
+    - cron: '30 14 * * 1-5'    # 周一到周五，UTC 14:30 = 北京时间 22:30
+
+  # 手动触发
+  workflow_dispatch:
+    inputs:
+      portfolio_path:
+        description: '持仓 JSON 路径（默认 data/portfolio.json）'
+        required: false
+        default: 'data/portfolio.json'
+        type: string
+      window_days:
+        description: '公告扫描窗口天数（默认 180）'
+        required: false
+        default: '180'
+        type: string
+      news_days:
+        description: '舆情检索窗口天数（默认 30，与公告窗口独立）'
+        required: false
+        default: '30'
+        type: string
+      push_min_level:
+        description: '达到该等级才推送：clear/watch/warning/high/critical'
+        required: false
+        default: 'warning'
+        type: string
+      with_news:
+        description: '是否启用舆情检索通道（A 股 + 港股）'
+        required: false
+        default: true
+        type: boolean
+      dry_run:
+        description: 'dry-run：不真正推送，只生成报告'
+        required: false
+        default: false
+        type: boolean
+
+# 并发控制：与持仓预警错开，避免同时打巨潮
+concurrency:
+  group: risk-scan
+  cancel-in-progress: false
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      TZ: Asia/Shanghai   # 全 job 用东八区，让 date.today() 按北京时间解读
+
+    steps:
+      - name: 随机延迟（避免固定时间访问）
+        run: sleep $((RANDOM % 60))
+
+      - name: 检出代码
+        uses: actions/checkout@v5
+
+      - name: 设置 Python 环境
+        uses: actions/setup-python@v6
+        with:
+          # 与 01-position-drawdown.yml 一致用 3.12：akshare 在 3.11 上
+          # 依赖的 numpy/pandas 组合与 requirements.txt 的条件表达式不匹配。
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: |
+          pip install --upgrade pip
+          # 排雷只用 akshare + requests + pandas，但复用完整 requirements.txt
+          # 保持与其它 workflow 一致，避免依赖解析差异导致行为不一致。
+          pip install -r requirements.txt
+
+      - name: 创建必要目录
+        run: |
+          mkdir -p data logs reports
+
+      # ── 跨运行状态（事件指纹去重）──
+      # GitHub Actions runner 是一次性的，两次运行之间没有磁盘。要回答
+      # "我有没有告诉过你了"，必须记住一点东西。
+      #
+      # 取：key 故意只写前缀，精确匹配必然失败 → 回落到前缀匹配 → 拿到
+      #     最近一次创建的那份。
+      # 存：key 必须每次唯一（run_id + run_attempt，Re-run 时 run_id 不变）。
+      #     同名 key 不可覆盖，存两次会直接报错。
+      - name: 取回上次状态（跨运行去重）
+        id: state-restore
+        uses: actions/cache/restore@v4
+        with:
+          path: data/risk_scan_state.json
+          key: risk-scan-state-
+
+      - name: 运行持仓排雷
+        env:
+          # ==========================================
+          # 通知渠道（与 00/01 workflow 保持一致；任一配置即生效）
+          # ==========================================
+          WECHAT_WEBHOOK_URL: ${{ secrets.WECHAT_WEBHOOK_URL }}
+          WECHAT_MSG_TYPE: ${{ vars.WECHAT_MSG_TYPE || secrets.WECHAT_MSG_TYPE || 'markdown' }}
+          FEISHU_WEBHOOK_URL: ${{ secrets.FEISHU_WEBHOOK_URL }}
+          FEISHU_WEBHOOK_SECRET: ${{ secrets.FEISHU_WEBHOOK_SECRET }}
+          FEISHU_WEBHOOK_KEYWORD: ${{ vars.FEISHU_WEBHOOK_KEYWORD || secrets.FEISHU_WEBHOOK_KEYWORD }}
+          DINGTALK_WEBHOOK_URL: ${{ secrets.DINGTALK_WEBHOOK_URL }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_MESSAGE_THREAD_ID: ${{ secrets.TELEGRAM_MESSAGE_THREAD_ID }}
+          EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVERS: ${{ vars.EMAIL_RECEIVERS || secrets.EMAIL_RECEIVERS }}
+          EMAIL_SENDER_NAME: ${{ vars.EMAIL_SENDER_NAME || secrets.EMAIL_SENDER_NAME || 'daily_stock_analysis股票分析助手' }}
+          PUSHOVER_USER_KEY: ${{ secrets.PUSHOVER_USER_KEY }}
+          PUSHOVER_API_TOKEN: ${{ secrets.PUSHOVER_API_TOKEN }}
+          NTFY_URL: ${{ secrets.NTFY_URL }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          GOTIFY_URL: ${{ secrets.GOTIFY_URL }}
+          GOTIFY_TOKEN: ${{ secrets.GOTIFY_TOKEN }}
+          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
+          PUSHPLUS_TOPIC: ${{ vars.PUSHPLUS_TOPIC || secrets.PUSHPLUS_TOPIC }}
+          CUSTOM_WEBHOOK_URLS: ${{ secrets.CUSTOM_WEBHOOK_URLS }}
+          CUSTOM_WEBHOOK_BEARER_TOKEN: ${{ secrets.CUSTOM_WEBHOOK_BEARER_TOKEN }}
+          CUSTOM_WEBHOOK_BODY_TEMPLATE: ${{ vars.CUSTOM_WEBHOOK_BODY_TEMPLATE || secrets.CUSTOM_WEBHOOK_BODY_TEMPLATE }}
+          WEBHOOK_VERIFY_SSL: ${{ vars.WEBHOOK_VERIFY_SSL || secrets.WEBHOOK_VERIFY_SSL || 'true' }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_MAIN_CHANNEL_ID: ${{ secrets.DISCORD_MAIN_CHANNEL_ID }}
+          FEISHU_APP_ID: ${{ secrets.FEISHU_APP_ID }}
+          FEISHU_APP_SECRET: ${{ secrets.FEISHU_APP_SECRET }}
+          FEISHU_FOLDER_TOKEN: ${{ secrets.FEISHU_FOLDER_TOKEN }}
+          FEISHU_CHAT_ID: ${{ vars.FEISHU_CHAT_ID || secrets.FEISHU_CHAT_ID }}
+          FEISHU_RECEIVE_ID_TYPE: ${{ vars.FEISHU_RECEIVE_ID_TYPE || secrets.FEISHU_RECEIVE_ID_TYPE }}
+          FEISHU_DOMAIN: ${{ vars.FEISHU_DOMAIN || secrets.FEISHU_DOMAIN }}
+          FEISHU_SEND_AS_FILE: ${{ vars.FEISHU_SEND_AS_FILE || secrets.FEISHU_SEND_AS_FILE }}
+          ASTRBOT_URL: ${{ secrets.ASTRBOT_URL }}
+          ASTRBOT_TOKEN: ${{ secrets.ASTRBOT_TOKEN }}
+          SERVERCHAN3_SENDKEY: ${{ secrets.SERVERCHAN3_SENDKEY }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
+
+          # ==========================================
+          # 排雷参数（走环境变量，不传 CLI 参数；改 vars 即可调整）
+          # ==========================================
+          RISK_SCAN_JSON_PATH: ${{ github.event.inputs.portfolio_path || vars.RISK_SCAN_JSON_PATH || 'data/portfolio.json' }}
+          RISK_SCAN_WINDOW_DAYS: ${{ github.event.inputs.window_days || vars.RISK_SCAN_WINDOW_DAYS || '180' }}
+          # 舆情窗口与公告窗口相互独立：舆情讲"最近出了什么事"（短），
+          # 公告要还原"这件事走到哪一步了"（长）。
+          RISK_SCAN_NEWS_WINDOW_DAYS: ${{ github.event.inputs.news_days || vars.RISK_SCAN_NEWS_WINDOW_DAYS || '30' }}
+          # 推送门槛：全绿日不推送，避免每天一条"今天没有雷"把通知渠道磨没。
+          # 想让关注档（WATCH）也推，改成 watch。
+          RISK_SCAN_PUSH_MIN_LEVEL: ${{ github.event.inputs.push_min_level || vars.RISK_SCAN_PUSH_MIN_LEVEL || 'warning' }}
+          # 缓解事件（结案 / 摘帽 / 处罚决定书）结算同类别风险时下调几级
+          RISK_SCAN_MITIGATION_TIERS: ${{ vars.RISK_SCAN_MITIGATION_TIERS || '2' }}
+          # 跨运行状态文件路径（由上面的 actions/cache 负责在运行之间传递）
+          RISK_SCAN_STATE_PATH: data/risk_scan_state.json
+          # 持仓来源：Gist（首选）或仓库内文件。
+          # /data/ 在 .gitignore 里，CI checkout 拿不到 data/portfolio.json，
+          # 因此必须配 Gist —— 与 01-position-drawdown.yml 共用同一个变量，
+          # 两边本来读的就是同一份 portfolio.json。
+          # raw URL 本身是访问令牌，属敏感信息，放 secrets。
+          POSITION_DRAWDOWN_GIST_URL: ${{ vars.POSITION_DRAWDOWN_GIST_URL || secrets.POSITION_DRAWDOWN_GIST_URL || '' }}
+          # 舆情检索通道开关。关掉后只跑交易所公告通道，港股将无任何信号。
+          RISK_SCAN_WITH_NEWS: ${{ github.event.inputs.with_news && '1' || vars.RISK_SCAN_WITH_NEWS || '1' }}
+          # ── 舆情通道依赖 LLM 搜索 provider 与新闻时效窗口 ──
+          # SearchService 默认 NEWS_STRATEGY_PROFILE=short 只有 3 天窗口，
+          # 会把所有结果滤掉（provider=Filtered）。排雷要看得更久。
+          NEWS_STRATEGY_PROFILE: 'long'
+          NEWS_MAX_AGE_DAYS: '90'
+          LLM_MINIMAX_API_KEY: ${{ secrets.LLM_MINIMAX_API_KEY }}
+          LLM_MINIMAX_BASE_URL: ${{ vars.LLM_MINIMAX_BASE_URL || secrets.LLM_MINIMAX_BASE_URL }}
+          LLM_MINIMAX_MODELS: ${{ vars.LLM_MINIMAX_MODELS || secrets.LLM_MINIMAX_MODELS }}
+          LLM_MINIMAX_PROTOCOL: ${{ vars.LLM_MINIMAX_PROTOCOL || 'anthropic' }}
+          TAVILY_API_KEYS: ${{ secrets.TAVILY_API_KEYS }}
+          SEARXNG_BASE_URLS: ${{ vars.SEARXNG_BASE_URLS || secrets.SEARXNG_BASE_URLS }}
+
+        run: |
+          # ── 1) 决定持仓文件来源：Gist 优先，回退仓库内路径 ──
+          # /data/ 在 .gitignore 第 57 行被排除，CI checkout 拿不到
+          # data/portfolio.json —— 没有 Gist 的话本 workflow 会每天静默空转。
+          # 与 01-position-drawdown.yml 共用同一个 secret（读的是同一份文件）。
+          if [ -n "$POSITION_DRAWDOWN_GIST_URL" ]; then
+            HTTP_STATUS=$(curl -s -o /tmp/portfolio.json -w "%{http_code}" "$POSITION_DRAWDOWN_GIST_URL")
+            if [ "$HTTP_STATUS" != "200" ]; then
+              echo "::error::Gist 拉取失败 HTTP $HTTP_STATUS。检查 POSITION_DRAWDOWN_GIST_URL / 文件名是否为 portfolio.json。"
+              cat /tmp/portfolio.json 2>/dev/null || true
+              exit 1
+            fi
+            if [ ! -s /tmp/portfolio.json ]; then
+              echo "::error::Gist 返回 200 但内容为空"
+              exit 1
+            fi
+            if ! python -c "import json; d=json.load(open('/tmp/portfolio.json')); assert isinstance(d.get('positions'), list)" 2>/dev/null; then
+              echo "::error::Gist 内容不是合法 portfolio.json（需含顶层 positions 数组）"
+              cat /tmp/portfolio.json
+              exit 1
+            fi
+            PORTFOLIO="/tmp/portfolio.json"
+            echo ">>> 持仓来源：Gist ($(wc -c < /tmp/portfolio.json) bytes)"
+          else
+            PORTFOLIO="$RISK_SCAN_JSON_PATH"
+            echo ">>> 持仓来源：仓库内 $PORTFOLIO"
+          fi
+
+          if [ ! -f "$PORTFOLIO" ]; then
+            echo "::warning::持仓文件 $PORTFOLIO 不存在，跳过本次排雷。"
+            echo "::warning::.gitignore 第 57 行排除了 /data/，CI 拿不到 data/portfolio.json。"
+            echo "::warning::请配置 secret POSITION_DRAWDOWN_GIST_URL（与持仓预警同一个）。"
+            echo "模板："
+            cat <<'TEMPLATE_EOF'
+          {
+            "description": "持仓清单",
+            "positions": [
+              { "code": "000776", "name": "广发证券", "cost_price": 10.00, "position_date": "2025-03-15" }
+            ]
+          }
+          TEMPLATE_EOF
+            exit 0
+          fi
+
+          # ── 2) 未配置任何通知渠道 → dry-run ──
+          if [ -z "$FEISHU_WEBHOOK_URL" ] && [ -z "$FEISHU_APP_ID" ] \
+             && [ -z "$WECHAT_WEBHOOK_URL" ] \
+             && [ -z "$DINGTALK_WEBHOOK_URL" ] \
+             && [ -z "$TELEGRAM_BOT_TOKEN" ] \
+             && [ -z "$DISCORD_WEBHOOK_URL" ] && [ -z "$DISCORD_BOT_TOKEN" ] \
+             && [ -z "$SLACK_WEBHOOK_URL" ] && [ -z "$SLACK_BOT_TOKEN" ] \
+             && [ -z "$EMAIL_SENDER" ] \
+             && [ -z "$PUSHOVER_USER_KEY" ] \
+             && [ -z "$NTFY_URL" ] \
+             && [ -z "$GOTIFY_URL" ] \
+             && [ -z "$PUSHPLUS_TOKEN" ] \
+             && [ -z "$CUSTOM_WEBHOOK_URLS" ] \
+             && [ -z "$ASTRBOT_URL" ] \
+             && [ -z "$SERVERCHAN3_SENDKEY" ]; then
+            echo "::warning::未配置任何通知渠道 secrets，将以 dry-run 模式运行（只生成报告）"
+            export RISK_SCAN_DRY_RUN=true
+          fi
+
+          DRY_FLAG=""
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            DRY_FLAG="--dry-run"
+            echo ">>> dry-run 模式：不真正推送"
+          fi
+
+          echo ">>> 持仓文件: $PORTFOLIO"
+          echo ">>> 公告窗口 ${RISK_SCAN_WINDOW_DAYS} 天　舆情窗口 ${RISK_SCAN_NEWS_WINDOW_DAYS} 天"
+          echo ">>> 推送门槛: $RISK_SCAN_PUSH_MIN_LEVEL"
+
+          REPORT_DATE=$(date +%F)
+          REPORT_FILE="reports/risk-scan/${REPORT_DATE}.md"
+          mkdir -p "$(dirname "$REPORT_FILE")"
+
+          SECONDS=0
+          python -m src.risk_scan.cli \
+            --portfolio "$PORTFOLIO" \
+            --report-file "$REPORT_FILE" \
+            $DRY_FLAG \
+            2>&1 | tee logs/risk-scan-run.log
+          echo "::notice::排雷耗时 ${SECONDS}s"
+
+      # 只在 CLI 退出码 0 时落盘。推送失败时 cli 会返回 3 且不写状态文件，
+      # 这里也不会存 —— 避免"这次没推成功却被标记为已告知"导致告警被吞。
+      - name: 写入本次状态
+        if: success()
+        uses: actions/cache/save@v4
+        with:
+          path: data/risk_scan_state.json
+          key: risk-scan-state-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: 上传报告
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: risk-scan-${{ github.run_number }}
+          path: |
+            reports/risk-scan/
+            logs/risk-scan-run.log
+          retention-days: 90
+          # 脚本崩了 / 持仓文件缺 / 数据源全挂时目录可能空着。
+          # 默认 v6 会把"0 文件"判成 error 让 job 翻红，但真正的失败原因
+          # 已经在前一步 exit 了，这里静默成功，别污染 job 状态。
+          if-no-files-found: ignore
+
+      - name: 显示今日报告
+        if: always()
+        run: |
+          echo ""
+          echo "=========================================="
+          echo "🛡️ 持仓排雷 · ${{ github.run_number }}"
+          echo "=========================================="
+          if [ -d "reports/risk-scan" ] && [ "$(ls -A reports/risk-scan 2>/dev/null)" ]; then
+            LATEST=$(ls -t reports/risk-scan/*.md 2>/dev/null | head -1)
+            if [ -n "$LATEST" ]; then
+              echo ""
+              echo "--- $LATEST ---"
+              cat "$LATEST"
+            fi
+          else
+            echo "⚠️ 未生成报告"
+          fi
